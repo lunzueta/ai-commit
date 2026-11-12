@@ -38,13 +38,15 @@ A Changes panel for Herdr with an AI button for the commit message. It shows the
   "providers": [
     { "name": "Anthropic", "provider": "anthropic", "api_key_env": "ANTHROPIC_API_KEY" },
     { "name": "Local server", "provider": "openai", "base_url": "http://localhost:8000/v1" },
-    { "name": "Ollama", "provider": "ollama" }
+    { "name": "Ollama", "provider": "ollama" },
+    { "name": "Ollama cloud", "provider": "ollama", "base_url": "https://ollama.com", "api_key_env": "OLLAMA_API_KEY" }
   ]
 }
 ```
 
 - `provider` is the API: `anthropic`, `openai` (any OpenAI-compatible server: OpenAI, SGLang, vLLM, LM Studio…) or `ollama`.
 - The menu lists every model that the provider's API reports: Anthropic's `/v1/models`, `<base_url>/models` for `openai`, and Ollama's local model list (embedding models are left out).
+- Ollama lists the models installed on that server (`/api/tags`). For the Ollama cloud catalog, add a second provider with `"base_url": "https://ollama.com"` and an `api_key_env` (chat with the cloud needs a key from ollama.com).
 - To fix the model of a provider instead of listing them, add `"model": "…"` to it; it then shows as the only entry.
 - Keys: `api_key` (in the file) or `api_key_env` (an environment variable name; the file then holds no secret). `ollama` needs none; `openai`-compatible servers take an optional key.
 - Anthropic needs a console API key. This mod does not use any other program's login or token.

@@ -285,11 +285,12 @@ export default class Changes extends View {
       const data = await res.json();
       return data.choices?.[0]?.message?.content ?? "";
     }
-    // Default: Ollama (local or remote). No key needed for a local server.
+    // Default: Ollama. A local server needs no key; ollama.com (cloud) needs one.
     const base = String(ai.base_url || "http://127.0.0.1:11434").replace(/\/$/, "");
+    const key = await this.apiKey(ai);
     const res = await fetch(`${base}/api/chat`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
       body: JSON.stringify({ model: ai.model, messages, stream: false }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
@@ -365,7 +366,9 @@ export default class Changes extends View {
       return ((await res.json()).data ?? []).map((m) => m.id);
     }
     if (p.provider === "ollama") {
-      const res = await fetch(`${base(p.base_url || "http://127.0.0.1:11434")}/api/tags`);
+      // The list needs no key; a key (for ollama.com) is sent when one is configured.
+      const key = await this.apiKey(p).catch(() => "");
+      const res = await fetch(`${base(p.base_url || "http://127.0.0.1:11434")}/api/tags`, { headers: key ? { authorization: `Bearer ${key}` } : {} });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       // Embedding models can't write messages: leave them out.
       return ((await res.json()).models ?? []).map((m) => m.name).filter((n) => !/embed/i.test(n));
