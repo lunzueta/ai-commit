@@ -293,6 +293,7 @@ export default class Changes extends View {
       headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
       body: JSON.stringify({ model: ai.model, messages, stream: false }),
     });
+    if (res.status === 401 && !key) throw new Error(`${ai.model} runs in the Ollama cloud and needs an API key: set the OLLAMA_API_KEY variable (ollama.com) or pick a model installed locally`);
     if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
     return data.message?.content ?? "";
