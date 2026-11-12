@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, home, shared, setShared } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, home, shared, setShared, nextCommand } from "herdr";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -42,7 +42,11 @@ export default class Changes extends View {
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
     this.refresh(cx);
     this.loadModelLabel(cx);
-    cx.timer.every(10000, (cx) => { this.refresh(cx); this.loadModelLabel(cx); });
+    // Local: refresh every 10 s. Remote: every 30 s, since each refresh runs Git over SSH.
+    this.ticks = 0;
+    cx.timer.every(10000, (cx) => { this.ticks++; if (!this.on || this.ticks % 3 === 0) this.refresh(cx); this.loadModelLabel(cx); });
+    // Keyboard: keys.json → "mod:ai-commit": { "ctrl-alt-g": "ai-commit.generate" }
+    cx.spawn(async (cx) => { for (;;) { const c = await nextCommand(); if (c === "generate") this.generateMessage(cx); cx.notify(); } });
   }
 
   watch(root, cx) {
@@ -165,80 +169,114 @@ export default class Changes extends View {
     return { list, chosen };
   }
 
-  // Asks the AI configured in settings.json (ai: {provider, model, base_url?, api_key?})
-  // for a Conventional Commits message for the staged diff, and fills the input.
+  // Asks the AI configured in settings.json for one Conventional Commits subject line
+  // for the staged diff (or the diff against HEAD when nothing is staged), and fills the box.
   generateMessage(cx) {
     if (this.generating) return;
     if (!this.root) { this.note = "AI: no repository loaded yet"; cx.notify(); return; }
     if (this.busy) { this.note = "AI: a commit is in progress"; cx.notify(); return; }
-    // The periodic refresh (every 10 s, slower on remotes) must not block the button:
-    // the diff is read straight from Git, so only the repo root is needed.
-    const root = this.root, on = this.on, context = this.context;
+    const root = this.root, on = this.on;
     this.generating = true; this.note = "AI: generating commit message…";
     cx.spawn(async (cx) => {
       try {
         const cfg = await this.readAiConfig();
         if (!cfg) throw new Error('no AI configured: set settings.json → "ai": {"models": [{"label": "…", "provider": "anthropic"|"openai"|"ollama", "model": "…"}]}');
         const ai = cfg.chosen;
-        const r = await exec("git", [...READ, "diff", "--staged", "--no-color"], { cwd: root, on });
-        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "git diff --staged failed");
-        let diff = r.stdout.trim();
-        if (!diff) {
-          // Nothing staged: fall back to everything the panel shows (vs HEAD),
-          // since Commit stages it all (git add -A) before committing.
-          const w = await exec("git", [...READ, "diff", "HEAD", "--no-color"], { cwd: root, on });
-          if (w.code !== 0) throw new Error((w.stderr || w.stdout).trim() || "git diff HEAD failed");
-          diff = w.stdout.trim();
+        const { diff, truncated } = await this.readDiff(root, on);
+        let subject = await this.askAi(ai, diff);
+        // The model does not always respect the length limit: ask once more for a shorter one.
+        if (subject.length > 50) {
+          const shorter = await this.askAi(ai, diff, `Your previous answer was ${subject.length} characters. Reply with a shorter subject, at most 50 characters.`).catch(() => "");
+          if (shorter) subject = shorter;
         }
-        if (!diff) throw new Error("no changes to summarize (nothing staged or modified)");
-        const text = await this.askAi(ai, diff);
-        const message = text.trim().replace(/^[\"']+|[\"']+$/g, "").split("\n").map(l => l.trim()).join(" ");
-        if (message) { this.input.set_value(message); this.message = message; this.note = null; }
-        else this.note = "AI returned an empty message";
-      } catch (e) { if (key() === context) this.note = `AI commit message failed: ${e}`; }
+        // The repository may have changed while the model was answering: drop the result then.
+        if (this.root !== root) return;
+        if (!subject) { this.note = "AI returned an empty message"; return; }
+        this.input.set_value(subject); this.message = subject;
+        const notes = [];
+        if (truncated) notes.push("Diff truncated to 60,000 characters for the AI.");
+        if (subject.length > 50) notes.push(`Subject is ${subject.length} characters (50 recommended).`);
+        this.note = notes.length ? notes.join(" ") : null;
+      } catch (e) { if (this.root === root) this.note = `AI commit message failed: ${e}`; }
       finally { this.generating = false; cx.notify(); }
     });
     cx.notify();
   }
 
-  async askAi(ai, diff) {
+  // Staged diff; if nothing is staged, the diff against HEAD (what Commit will stage with git add -A).
+  async readDiff(root, on) {
+    const r = await exec("git", [...READ, "diff", "--staged", "--no-color"], { cwd: root, on });
+    if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "git diff --staged failed");
+    let diff = r.stdout.trim();
+    if (!diff) {
+      const w = await exec("git", [...READ, "diff", "HEAD", "--no-color"], { cwd: root, on });
+      if (w.code !== 0) throw new Error((w.stderr || w.stdout).trim() || "git diff HEAD failed");
+      diff = w.stdout.trim();
+    }
+    if (!diff) throw new Error("no changes to summarize (nothing staged or modified)");
+    const LIMIT = 60000;
+    return { diff: diff.slice(0, LIMIT), truncated: diff.length > LIMIT };
+  }
+
+  // The API key for a model: "api_key" in settings.json, or the environment variable named by "api_key_env".
+  async apiKey(ai) {
+    if (ai.api_key) return ai.api_key;
+    if (!ai.api_key_env) return "";
+    const name = String(ai.api_key_env);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`invalid api_key_env name: ${name}`);
+    const unix = await exec("printenv", [name]).catch(() => null);
+    if (unix?.code === 0 && unix.stdout.trim()) return unix.stdout.trim();
+    const win = await exec("powershell", ["-NoProfile", "-Command", `$v=[Environment]::GetEnvironmentVariable('${name}','User'); if(-not $v){$v=$env:${name}}; Write-Output $v`]).catch(() => null);
+    if (win?.code === 0 && win.stdout.trim()) return win.stdout.trim();
+    throw new Error(`environment variable ${name} is not set`);
+  }
+
+  // One subject line from the chosen model. retryHint is appended when the previous answer was too long.
+  async askAi(ai, diff, retryHint) {
     const system = "You write git commit messages. Reply with only one line: the commit subject. No body, no quotes, no explanation, no markdown.";
-    const user = `Write one Conventional Commits subject line for these changes.\nFormat: type(scope): subject\n- type: fix for corrections, feat only for new behavior, refactor, test, docs, chore as appropriate.\n- imperative mood, lowercase subject, no trailing period, at most 50 characters in total.\n- describe the change, not its results or metrics.\n\n${diff.slice(0, 60000)}`;
+    const user = `Write one Conventional Commits subject line for these changes.\nFormat: type(scope): subject\n- type: fix for corrections, feat only for new behavior, refactor, test, docs, chore as appropriate.\n- imperative mood, lowercase subject, no trailing period, at most 50 characters in total.\n- describe the change, not its results or metrics.${retryHint ? `\n- ${retryHint}` : ""}\n\n${diff}`;
+    const raw = await this.callModel(ai, system, user);
+    // First non-empty line, without quotes, backticks or a trailing period.
+    const line = raw.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+    return line.replace(/^[\"'`]+|[\"'`]+$/g, "").replace(/\.$/, "").trim();
+  }
+
+  async callModel(ai, system, user) {
     const messages = [{ role: "system", content: system }, { role: "user", content: user }];
-    let res;
     if (ai.provider === "anthropic") {
-      // Anthropic API key (console key), set per model in settings.json as "api_key".
-      if (!ai.api_key) throw new Error('no Anthropic API key: set "api_key" for this model in settings.json');
-      res = await fetch("https://api.anthropic.com/v1/messages", {
+      const key = await this.apiKey(ai);
+      if (!key) throw new Error('no Anthropic API key: set "api_key" or "api_key_env" for this model in settings.json');
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": ai.api_key },
-        body: JSON.stringify({ model: ai.model, max_tokens: 2048, system, messages: [{ role: "user", content: user }] }),
+        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key },
+        body: JSON.stringify({ model: ai.model, max_tokens: 512, system, messages: [{ role: "user", content: user }] }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`.slice(0, 200));
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
       const data = await res.json();
       const text = (data.content ?? []).filter((b) => b.type === "text").map((b) => b.text).join("");
-      if (!text.trim()) throw new Error(`no text in reply (stop_reason=${data.stop_reason}, blocks=${(data.content ?? []).map((b) => b.type).join(",") || "none"})`);
+      if (!text.trim()) throw new Error(`no text in reply (stop_reason=${data.stop_reason})`);
       return text;
     }
     if (ai.provider === "openai") {
+      const key = await this.apiKey(ai);
       const base = String(ai.base_url || "https://api.openai.com/v1").replace(/\/$/, "");
-      res = await fetch(`${base}/chat/completions`, {
+      const res = await fetch(`${base}/chat/completions`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...(ai.api_key ? { authorization: `Bearer ${ai.api_key}` } : {}) },
-        body: JSON.stringify({ model: ai.model, messages }),
+        headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
+        body: JSON.stringify({ model: ai.model, messages, max_tokens: 512 }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`.slice(0, 200));
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
       const data = await res.json();
       return data.choices?.[0]?.message?.content ?? "";
     }
-    // Default: Ollama (local or remote).
+    // Default: Ollama (local or remote). No key needed for a local server.
     const base = String(ai.base_url || "http://127.0.0.1:11434").replace(/\/$/, "");
-    res = await fetch(`${base}/api/chat`, {
+    const res = await fetch(`${base}/api/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: ai.model, messages, stream: false }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`.slice(0, 200));
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
     return data.message?.content ?? "";
   }
@@ -325,7 +363,7 @@ export default class Changes extends View {
       .child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
         .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
         .child(div().id("commit-model").h(32).px(8).flex().items_center().rounded(8).border_1().border_color(t.border).text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("AI model for commit messages (click to change)")
-          .on_click((_e, cx) => this.cycleModel(cx)).child(this.modelLabel()))
+          .on_click((_e, cx) => this.cycleModel(cx)).child(div().max_w(96).truncate().child(this.modelLabel())))
         .child(div().id("commit-ai").h(32).w(32).flex().items_center().justify_center().rounded(8).border_1().border_color(this.generating ? t.accent : t.border).text_color(this.generating ? t.accent : t.muted).tooltip("Generate commit message from staged changes with AI")
           .when(!this.generating, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)))
           .on_click((_e, cx) => this.generateMessage(cx))
