@@ -1,5 +1,5 @@
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, EditorState, Editor, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, shared, setShared, nextCommand, knownAgents } from "herdr";
 
 function location() {
@@ -18,16 +18,71 @@ const countLines = (text) => text ? text.split("\n").length - Number(text.endsWi
 // print() returns the arguments, prompt last; list (optional) lists their models.
 // None of them needs a key here: each uses the logins it already has.
 const AGENT_CLI = {
-  claude: { name: "Claude Code", print: (p, m) => [...(m ? ["--model", m] : []), "-p", p] },
+  claude: {
+    name: "Claude Code",
+    print: (p, m) => [...(m ? ["--model", m] : []), "-p", "--output-format", "json", p],
+    // JSON mode keeps the answer in "result"; the thinking and the plan are not in it.
+    parse: (out) => {
+      try {
+        const data = JSON.parse(out);
+        if (data.is_error) throw new Error(String(data.result ?? data.subtype ?? "claude reported an error"));
+        return String(data.result ?? "");
+      } catch (e) { if (e instanceof SyntaxError) return out; throw e; }
+    },
+  },
   pi: { name: "Pi", print: (p, m) => ["-p", "--no-session", "--no-tools", "--no-context-files", ...(m ? ["--model", m] : []), p], list: ["--list-models"] },
   codex: { name: "Codex", print: (p, m) => ["exec", "--skip-git-repo-check", "--sandbox", "read-only", ...(m ? ["--model", m] : []), p] },
   gemini: { name: "Gemini", print: (p, m) => [...(m ? ["-m", m] : []), p] },
   copilot: { name: "Copilot", print: (p, m) => [...(m ? ["--model", m] : []), "-p", p] },
 };
-// A prompt that a command line can carry on every platform.
-const AGENT_PROMPT_LIMIT = 7000;
+// What a command line can carry on every platform (8191 on Windows, and the rest is argv overhead).
+const AGENT_PROMPT_LIMIT = 7600;
 // The last lines of a failed run: where CLIs put the reason.
 const tail = (text) => String(text).trim().split("\n").filter(Boolean).slice(-3).join(" ").slice(0, 240);
+// What a subject has to look like: a type, an optional scope, a colon, then text.
+const SUBJECT_SHAPE = /^[a-z][a-z0-9-]*(\([^)]{0,40}\))?!?: \S/;
+
+// A provider's "filter" keeps its menu short: "claude-bridge/*", "*sonnet*", or exactly one name.
+function keepByFilter(filter, name) {
+  if (!filter) return true;
+  const f = String(filter), n = String(name);
+  if (!f.includes("*")) return n === f;
+  const [a, b] = f.split("*");
+  return n.length >= a.length + b.length && n.startsWith(a) && n.endsWith(b);
+}
+
+// The body under the subject line: the lines after the last subject-shaped line, bullets kept,
+// labels dropped, at most 6 lines of 72 characters. Empty when the model gave none.
+function pickBody(raw, subject) {
+  const lines = String(raw).split(NL).map((l) => l.trim());
+  const norm = (l) => l.replace(/^[-*`"'\s]+|[-*`"'\s]+$/g, "").replace(/^(commit )?subject\s*:\s*/i, "").replace(/\.$/, "").trim();
+  let at = -1;
+  lines.forEach((l, i) => { if (norm(l) === subject) at = i; });
+  if (at < 0) return "";
+  return lines.slice(at + 1)
+    .filter((l) => l && !/^```/.test(l) && !/^[-*]?\s*(body|footer|subject)\s*:/i.test(l))
+    .slice(0, 6).map((l) => (l.length > 72 ? l.slice(0, 72) : l)).join(NL).trim();
+}
+
+// The subject out of whatever a model printed: a Conventional Commits line if there is one
+// (the last one: an agent that thinks out loud ends with the answer), else the last short line.
+const SUBJECT = /^(feat|fix|chore|docs|refactor|test|build|ci|perf|style|revert)(\([^)]{0,40}\))?!?:\s+\S/;
+// The diff's file sections, the one with the most changed lines first.
+function byWeight(diff) {
+  const parts = String(diff).split(/^(?=diff --git )/m);
+  if (parts.length < 2) return diff;
+  const weight = (part) => (part.match(/^[+-][^+-]/gm) || []).length;
+  return parts.map((part, i) => [weight(part), i, part]).sort((a, b) => b[0] - a[0] || a[1] - b[1]).map(([, , part]) => part).join("");
+}
+
+function pickSubject(raw) {
+  const lines = String(raw).split(NL).map((l) => l.trim().replace(/^[-*`"'\s]+|[-*`"'\s]+$/g, "")).filter(Boolean)
+    .map((l) => l.replace(/^(commit )?subject\s*:\s*/i, ""));
+  const typed = lines.filter((l) => SUBJECT.test(l));
+  const line = typed.length ? typed[typed.length - 1] : (lines.filter((l) => l.length <= 100).pop() ?? lines.pop() ?? "");
+  return line.replace(/\.$/, "").trim();
+}
+
 // A batch file (.cmd) cannot carry a line break in its arguments: the shim gets one line, marked.
 const NL = String.fromCharCode(10);
 
@@ -51,13 +106,13 @@ function diffRows(lines) {
 export default class Changes extends View {
   init(_props, cx) {
     this.files = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.generating = false; this.handle = cx.focus_handle();
-    this.input = InputState.new({ placeholder: "Commit message" });
+    // Multi-line: a subject, a blank line and a body. Enter is a new line; the Commit button commits.
+    this.input = EditorState.new({ language: "text", line_numbers: false, folding: false, soft_wrap: true, font_size: 12 });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
       this.message = this.input.value();
       if (hadMessage !== Boolean(this.message.trim())) cx.notify();
     });
-    this.input.on("submit", (_e, cx) => this.commit(cx));
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
     this.refresh(cx);
@@ -239,22 +294,32 @@ export default class Changes extends View {
         if (!p || (!p.model && p.provider !== "agent" && !model)) throw new Error("no model selected: open the model menu next to the sparkles button");
         const ai = { ...p, model };
         const { diff, truncated } = await this.readDiff(root, on);
-        // An agent takes the prompt as an argument, so it has to fit a command line.
-        const cut = p.provider === "agent" && diff.length > AGENT_PROMPT_LIMIT, text = cut ? diff.slice(0, AGENT_PROMPT_LIMIT) : diff;
-        let subject = await this.askAi(ai, text);
+        const summary = (this.files ?? []).slice(0, 20).map((f) => `${f.path} (+${f.add || 0} −${f.del || 0})`).join(NL);
+        // An agent takes the whole prompt as one argument, so the diff gets what the instructions leave.
+        const budget = p.provider === "agent" ? Math.max(1000, AGENT_PROMPT_LIMIT - (summary.length + 900)) : diff.length;
+        const cut = diff.length > budget, text = cut ? diff.slice(0, budget) : diff;
+        const ask = (hint) => this.askFull(ai, text, hint, summary).catch(() => ({ subject: "", body: "" }));
+        let { subject, body } = await ask(null);
+        // A weak model answers in prose ("Change LICENSE to 0BSD and …"): ask once for the shape.
+        if (!SUBJECT_SHAPE.test(subject)) {
+          const fixed = await ask('Your answer was not a "type(scope): subject" line. Reply with only that line: one type from the list, a colon, then the subject.');
+          if (SUBJECT_SHAPE.test(fixed.subject)) ({ subject, body } = fixed);
+        }
         // The model does not always respect the length limit: ask once more for a shorter one.
         if (subject.length > 50) {
-          const shorter = await this.askAi(ai, text, `Your previous answer was ${subject.length} characters. Reply with a shorter subject, at most 50 characters.`).catch(() => "");
-          if (shorter) subject = shorter;
+          const shorter = await ask(`Your previous answer was ${subject.length} characters. Reply with a shorter subject, at most 50 characters.`);
+          if (shorter.subject && (shorter.subject.length < subject.length || !SUBJECT_SHAPE.test(subject))) ({ subject, body } = shorter);
         }
         // The repository may have changed, or the request given up on, while the model was answering.
         if (id !== this.genId || this.root !== root) return;
         if (!subject) { this.note = "AI returned an empty message"; this.noteError = true; return; }
-        this.input.set_value(subject); this.message = subject;
+        const full = body ? subject + NL + NL + body : subject;
+        this.input.set_value(full); this.message = full;
         const notes = [];
         if (truncated) notes.push("Diff truncated to 60,000 characters for the AI.");
-        if (cut) notes.push(`Diff truncated to ${AGENT_PROMPT_LIMIT.toLocaleString()} characters for the agent.`);
+        if (cut) notes.push("Diff truncated to fit the agent's command line.");
         if (subject.length > 50) notes.push(`Subject is ${subject.length} characters (50 recommended).`);
+        if (!SUBJECT_SHAPE.test(subject)) notes.push("The model did not answer as type(scope): subject; edit it.");
         this.note = notes.length ? notes.join(" ") : null; this.noteError = false;
       } catch (e) { if (id === this.genId && this.root === root) { this.note = `AI commit message failed: ${e}`; this.noteError = true; } }
       finally { if (id === this.genId) { this.generating = false; cx.notify(); } }
@@ -274,8 +339,10 @@ export default class Changes extends View {
       diff = w.stdout.trim();
     }
     const fresh = await this.untracked(root, on);
-    if (fresh) diff = diff ? `${diff}\n${fresh}` : fresh;
+    if (fresh) diff = diff ? `${diff}${NL}${fresh}` : fresh;
     if (!diff) throw new Error("no changes to summarize (nothing staged, modified or untracked)");
+    // Biggest file first: git writes the diff in path order, so a cut would keep LICENSE and drop the code.
+    diff = byWeight(diff);
     const LIMIT = 60000;
     return { diff: diff.slice(0, LIMIT), truncated: diff.length > LIMIT };
   }
@@ -312,14 +379,35 @@ export default class Changes extends View {
   }
 
   // One subject line from the chosen model. retryHint is appended when the previous answer was too long.
-  async askAi(ai, diff, retryHint) {
-    const system = "You write git commit messages. Reply with only one line: the commit subject. No body, no quotes, no explanation, no markdown.";
-    const user = `Write one Conventional Commits subject line for these changes.\nFormat: type(scope): subject\n- type: fix for corrections, feat only for new behavior, refactor, test, docs, chore as appropriate.\n- imperative mood, lowercase subject, no trailing period, at most 50 characters in total.\n- describe the change, not its results or metrics.${retryHint ? `\n- ${retryHint}` : ""}\n\n${diff}`;
-    const raw = await this.callModel(ai, system, user);
-    // First non-empty line, without quotes, backticks or a trailing period.
-    const line = raw.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
-    return line.replace(/^[\"'`]+|[\"'`]+$/g, "").replace(/\.$/, "").trim();
+  // One subject line. retryHint is appended when the previous answer was too long; summary says what
+  // changed even when the diff is cut, so a truncated diff is not read as "only the first file".
+  async askAi(ai, diff, retryHint, summary) {
+    return (await this.askFull(ai, diff, retryHint, summary)).subject;
   }
+
+  // The subject and the body of a commit message. retryHint is appended when the previous answer was
+  // too long; summary says what changed even when the diff is cut.
+  async askFull(ai, diff, retryHint, summary) {
+    const system = "You write git commit messages: a subject line, a blank line, then a short body. No quotes, no markdown fences, nothing before or after the message. If you think first, the message is the last thing in your reply.";
+    const head = [
+      "Write a git commit message for these changes.",
+      summary ? "Files changed:" + NL + summary : "",
+      "Subject: type(scope): subject",
+      "- type: fix for corrections, feat only for new behavior, refactor, test, docs, chore as appropriate.",
+      "- the subject describes the whole change, every file in the list, not one of them: a mixed change gets one broad subject that covers it (e.g. \"refactor(ai-commit): rework agent subjects, menu and license\").",
+      "- prefer a broad subject that fits the 50 characters over a narrow one that leaves parts out.",
+      "- imperative mood, lowercase subject, no trailing period, at most 50 characters in total.",
+      "Body: after one blank line, 2 to 4 short bullet lines starting with \"- \", each under 72 characters, saying what changed and why. Name the main files. Do not repeat the subject.",
+      "- describe the change, not its results or metrics.",
+      retryHint ? "- " + retryHint : "",
+    ].filter(Boolean).join(NL);
+    // An agent CLI may print its plan before the answer: pick the line that is a subject, and the body under it.
+    const raw = await this.callModel(ai, system, head + NL + NL + diff);
+    const subject = pickSubject(raw);
+    return { subject, body: subject ? pickBody(raw, subject) : "" };
+  }
+
+
 
   // Windows installs several agent CLIs as .cmd shims: a direct spawn looks for .exe only, and a batch
   // file cannot carry a line break in its arguments, so the shim gets the prompt on one line.
@@ -327,7 +415,7 @@ export default class Changes extends View {
     try { return await exec(command, args, options); }
     catch (e) {
       if (!/program not found/i.test(String(e))) throw e;
-      const flat = args.map((a) => (typeof a === "string" && a.includes(NL) ? a.split(NL).join(" ⏎ ") : a));
+      const flat = args.map((a) => (typeof a === "string" && a.includes(NL) ? a.split(NL).join("⏎") : a));
       try { return await exec(`${command}.cmd`, flat, options); } catch { throw e; }
     }
   }
@@ -343,7 +431,7 @@ export default class Changes extends View {
       const args = ai.command ? [...ai.command.slice(1).map(String), prompt] : spec.print(prompt, ai.model || "");
       const r = await this.runCli(command, args, { timeout: 240000 });
       if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout) || `${command} exited with code ${r.code}`);
-      return r.stdout;
+      return spec?.parse ? spec.parse(r.stdout) : r.stdout;
     }
     const messages = [{ role: "system", content: system }, { role: "user", content: user }];
     if (ai.provider === "anthropic") {
@@ -389,10 +477,12 @@ export default class Changes extends View {
   commit(cx) {
     if (!this.message.trim() || !this.root || this.busy || this.loading || this.context !== key()) return;
     const root = this.root, on = this.on, context = this.context, message = this.message.trim();
+    const [headline, ...rest] = message.split(NL), bodyText = rest.join(NL).trim();
+    const commitArgs = ["commit", "-m", headline.trim(), ...(bodyText ? ["-m", bodyText] : [])];
     this.busy = true; this.note = null;
     cx.spawn(async (cx) => {
       try {
-        for (const args of [["add", "-A"], ["commit", "-m", message]]) {
+        for (const args of [["add", "-A"], commitArgs]) {
           const r = await exec("git", args, { cwd: root, on });
           if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         }
@@ -436,7 +526,11 @@ export default class Changes extends View {
     // In parallel: one unreachable server must not hold up the others' lists.
     await Promise.all(cfg.providers.map(async (p) => {
       if (this.catalog[p.name]) return;
-      try { this.catalog[p.name] = { models: await this.fetchModels(p) }; }
+      try {
+        const models = await this.fetchModels(p);
+        const kept = models.length === 1 && models[0] === null ? models : models.filter((m) => keepByFilter(p.filter, m));
+        this.catalog[p.name] = kept.length || !p.filter ? { models: kept } : { error: `no model matches ${p.filter}` };
+      }
       catch (e) { this.catalog[p.name] = { error: String(e).replace(/^Error:\s*/, "").slice(0, 160) }; }
       cx.notify();
     }));
@@ -492,28 +586,34 @@ export default class Changes extends View {
     cx.notify();
   }
 
+  // One clickable line: ✓ when it is the chosen one, then its name.
+  modelRow(p, model, label, t) {
+    const on = this.selected?.provider === p.name && (this.selected?.model ?? null) === (model ?? null);
+    return h_flex().id(`model-${p.name}-${model ?? "default"}`).h(26).px(10).gap(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover)).when(on, (e) => e.bg(t.selected))
+      .on_click((_e, cx) => this.pickModel(p.name, model, cx))
+      .child(div().w(12).text_color(t.accent).child(on ? "✓" : ""))
+      .child(div().flex_1().min_w(0).truncate().child(label));
+  }
+
   modelMenu(t) {
     const rows = [], providers = this.providers ?? [];
     if (this.auto) rows.push(div().px(10).pt(6).pb(2).text_size(10).text_color(t.dim).child('No "ai" in settings.json: the agents you already have'));
     for (const p of providers) {
-      rows.push(div().px(10).pt(8).pb(2).text_size(10).text_color(t.dim).font_semibold().child(p.name.toUpperCase()));
       const entry = this.catalog?.[p.name];
+      // An agent is a single choice, so it needs no heading and no "its own model" line under it.
+      if (entry?.models?.length === 1 && entry.models[0] === null) { rows.push(this.modelRow(p, null, p.name, t)); continue; }
+      rows.push(div().px(10).pt(8).pb(2).text_size(10).text_color(t.dim).font_semibold().child(p.name.toUpperCase()));
       if (!entry) rows.push(div().px(10).py(4).text_size(11).text_color(t.dim).child("loading…"));
       else if (entry.error) rows.push(div().px(10).py(4).text_size(11).text_color(t.ansi1).child(entry.error));
       else if (!entry.models.length) rows.push(div().px(10).py(4).text_size(11).text_color(t.dim).child("no models"));
-      else for (const m of entry.models) {
-        const on = this.selected?.provider === p.name && (this.selected?.model ?? null) === (m ?? null);
-        rows.push(h_flex().id(`model-${p.name}-${m}`).h(26).px(10).gap(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover)).when(on, (e) => e.bg(t.selected))
-          .on_click((_e, cx) => this.pickModel(p.name, m, cx))
-          .child(div().w(12).text_color(t.accent).child(on ? "✓" : ""))
-          .child(div().flex_1().min_w(0).truncate().child(m ?? "default (its own model)")));
-      }
+      else for (const m of entry.models) rows.push(this.modelRow(p, m, m ?? "default (its own model)", t));
     }
-    if (!providers.length) rows.push(div().px(10).py(6).text_size(11).text_color(t.dim).child('No providers: add an "ai" section to settings.json'));
+    if (!providers.length) rows.push(div().px(10).py(6).text_size(11).text_color(t.dim).child('Nothing to ask: install an agent (claude, codex, gemini, copilot, pi) or add "ai" with a provider'));
     // The menu lives inside the panel (clipped by its overflow), so size it to the panel.
     const h = Math.max(160, Math.min(360, (this.panelH ?? 620) - 70)), w = Math.max(140, Math.min(300, (this.panelW ?? 320) - 20));
-    return v_flex().id("model-menu").absolute().right(10).bottom(54).w(w).max_h(h).overflow_y_scroll().py(4).rounded(8).border_1().border_color(t.border).bg(t.popover).children(rows);
+    return v_flex().id("model-menu").absolute().right(10).bottom(122).w(w).max_h(h).overflow_y_scroll().py(4).rounded(8).border_1().border_color(t.border).bg(t.popover).children(rows);
   }
+
 
   diffRow({ kind, number, text }, t) {
     if (kind === "@") return div().w_full().px(12).h(20).flex_none().truncate().bg(t.raised).text_color(t.dim).child(text);
@@ -554,8 +654,10 @@ export default class Changes extends View {
         .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes"))))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(this.noteError ? t.ansi1 : t.muted).child(this.note)))
       .when(this.menuOpen, (e) => e.child(this.modelMenu(t)))
-      .child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
-        .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
+      .child(h_flex().flex_none().p(10).gap(8).items_end().border_t(1).border_color(t.border)
+        .child(div().id("commit-message").relative().flex_1().min_w(0).h(96).px(10).py(6).rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .when(!this.message.trim(), (e) => e.child(div().absolute().top(6).left(10).text_size(12).text_color(t.dim).child("Commit message")))
+          .child(Editor.new(this.input).size_full().text_size(12).text_color(t.foreground)))
         .child(h_flex().id("commit-model").h(32).px(10).gap(6).items_center().rounded(8).border_1().border_color(this.menuOpen ? t.accent : t.border).text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Model for commit messages: click to choose")
           .on_click((_e, cx) => this.toggleMenu(cx))
           .child(div().max_w(110).truncate().child(this.modelLabel())).child(div().text_size(9).child("▾")))
