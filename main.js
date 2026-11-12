@@ -370,8 +370,12 @@ export default class Changes extends View {
       const key = await this.apiKey(p).catch(() => "");
       const res = await fetch(`${base(p.base_url || "http://127.0.0.1:11434")}/api/tags`, { headers: key ? { authorization: `Bearer ${key}` } : {} });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      // Embedding models can't write messages: leave them out.
-      return ((await res.json()).models ?? []).map((m) => m.name).filter((n) => !/embed/i.test(n));
+      // Embedding models can't write messages: leave them out. On a local server, models tagged
+      // "-cloud" / ":cloud" only run on ollama.com (listed under the cloud provider), so leave them out too.
+      const local = !p.base_url || /127\.0\.0\.1|localhost/.test(p.base_url);
+      return ((await res.json()).models ?? []).map((m) => m.name)
+        .filter((n) => !/embed/i.test(n))
+        .filter((n) => !(local && /[:-]cloud$/.test(n)));
     }
     throw new Error(`unknown provider "${p.provider}"`);
   }
