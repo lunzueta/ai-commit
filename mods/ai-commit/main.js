@@ -290,6 +290,15 @@ export default class Changes extends View {
     return line.replace(/^[\"'`]+|[\"'`]+$/g, "").replace(/\.$/, "").trim();
   }
 
+  // pi ships as a shim on Windows (pi.cmd); a direct spawn looks for pi.exe only.
+  async runPi(args, options) {
+    try { return await exec("pi", args, options); }
+    catch (e) {
+      if (!/program not found/i.test(String(e))) throw e;
+      try { return await exec("pi.cmd", args, options); } catch { throw e; }
+    }
+  }
+
   async callModel(ai, system, user) {
     if (ai.provider === "pi") {
       // Runs pi non-interactively with its own configured model and login (e.g. an Anthropic subscription).
@@ -299,7 +308,7 @@ export default class Changes extends View {
       const file = `${dir}/request.txt`;
       await fs.writeFile(file, `${system}\n\n${user}`, "utf8");
       try {
-        const r = await exec("pi", ["-p", "--no-session", "--no-tools", "--no-context-files", "--model", ai.model, "Answer the request in the attached file. Reply with only the commit subject line.", `@${file}`], { timeout: 240000 });
+        const r = await this.runPi(["-p", "--no-session", "--no-tools", "--no-context-files", "--model", ai.model, "Answer the request in the attached file. Reply with only the commit subject line.", `@${file}`], { timeout: 240000 });
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 200) || `pi exited with code ${r.code}`);
         return r.stdout;
       } finally {
@@ -395,7 +404,7 @@ export default class Changes extends View {
     await Promise.all(cfg.providers.map(async (p) => {
       if (this.catalog[p.name]) return;
       try { this.catalog[p.name] = { models: await this.fetchModels(p) }; }
-      catch (e) { this.catalog[p.name] = { error: String(e).slice(0, 160) }; }
+      catch (e) { this.catalog[p.name] = { error: String(e).replace(/^Error:\s*/, "").slice(0, 160) }; }
       cx.notify();
     }));
   }
@@ -404,7 +413,7 @@ export default class Changes extends View {
     if (p.model) return [p.model];
     if (p.provider === "pi") {
       // pi's own model list ("provider/model"): its logins and keys are used, nothing is read here.
-      const r = await exec("pi", ["--list-models"], { timeout: 60000 });
+      const r = await this.runPi(["--list-models"], { timeout: 60000 });
       if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 160) || "pi --list-models failed");
       return r.stdout.split("\n").slice(1).map((l) => l.trim().split(/\s+/)).filter((t) => t.length >= 2).map(([prov, model]) => `${prov}/${model}`);
     }
