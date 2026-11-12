@@ -242,7 +242,7 @@ export default class Changes extends View {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`invalid api_key_env name: ${name}`);
     const unix = await exec("printenv", [name]).catch(() => null);
     if (unix?.code === 0 && unix.stdout.trim()) return unix.stdout.trim();
-    const win = await exec("powershell", ["-NoProfile", "-Command", `$v=[Environment]::GetEnvironmentVariable('${name}','User'); if(-not $v){$v=$env:${name}}; Write-Output $v`]).catch(() => null);
+    const win = await exec("powershell", ["-NoProfile", "-Command", `$v=[Environment]::GetEnvironmentVariable('${name}','User'); if(-not $v){$v=[Environment]::GetEnvironmentVariable('${name}','Machine')}; if(-not $v){$v=$env:${name}}; Write-Output $v`]).catch(() => null);
     if (win?.code === 0 && win.stdout.trim()) return win.stdout.trim();
     throw new Error(`environment variable ${name} is not set`);
   }
