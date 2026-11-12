@@ -1,7 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import * as fs from "fs/promises";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, shared, setShared, nextCommand } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, shared, setShared, nextCommand, knownAgents } from "herdr";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -14,6 +13,23 @@ const key = () => JSON.stringify(location());
 // the folder watch would see it, and every refresh would start the next one.
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
+
+// Agent CLIs this mod knows how to ask for one line, by their knownAgents() key.
+// print() returns the arguments, prompt last; list (optional) lists their models.
+// None of them needs a key here: each uses the logins it already has.
+const AGENT_CLI = {
+  claude: { name: "Claude Code", print: (p, m) => [...(m ? ["--model", m] : []), "-p", p] },
+  pi: { name: "Pi", print: (p, m) => ["-p", "--no-session", "--no-tools", "--no-context-files", ...(m ? ["--model", m] : []), p], list: ["--list-models"] },
+  codex: { name: "Codex", print: (p, m) => ["exec", "--skip-git-repo-check", "--sandbox", "read-only", ...(m ? ["--model", m] : []), p] },
+  gemini: { name: "Gemini", print: (p, m) => [...(m ? ["-m", m] : []), p] },
+  copilot: { name: "Copilot", print: (p, m) => [...(m ? ["--model", m] : []), "-p", p] },
+};
+// A prompt that a command line can carry on every platform.
+const AGENT_PROMPT_LIMIT = 7000;
+// The last lines of a failed run: where CLIs put the reason.
+const tail = (text) => String(text).trim().split("\n").filter(Boolean).slice(-3).join(" ").slice(0, 240);
+// A batch file (.cmd) cannot carry a line break in its arguments: the shim gets one line, marked.
+const NL = String.fromCharCode(10);
 
 // Text draws a tab as nothing: pad each to the next 4-column stop.
 const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
@@ -165,31 +181,43 @@ export default class Changes extends View {
 
   // settings() only exposes the app's look and zoom/sounds, not the raw file,
   // so the ai section is read straight from settings.json in the app home.
-  // settings.json → "ai": { "default": {"provider", "model"}, "providers": [ { "name", "provider", "base_url"?, "api_key"?, "api_key_env"?, "model"? } ] }
-  // Without "model", a provider's models are listed from its API (Anthropic, OpenAI-compatible, Ollama).
-  // The old format ("models": [{label, provider, model}] or one object) still works.
+  // settings.json → "ai": { "default": {"provider", "model"}, "providers": [ { "name", "provider", "agent"?, "command"?, "base_url"?, "api_key"?, "api_key_env"?, "model"? } ] }
+  // provider: "agent" (an agent CLI that is already logged in), "anthropic", "openai" or "ollama".
+  // Without "model", a provider's models are listed from its API (Anthropic, OpenAI-compatible, Ollama) or from its CLI (pi).
+  // With no "ai" section at all, the agents installed on this machine are offered as they are.
+  // The old formats ("models": [{label, provider, model}], "provider": "pi" or one object) still work.
   async readAiConfig() {
     const text = await readTextFile(`${appHome()}/settings.json`).catch(() => null);
-    if (!text) return null;
-    let ai;
-    try { ai = JSON.parse(text).ai; } catch { return null; }
-    if (!ai) return null;
-    let providers = Array.isArray(ai.providers)
+    let ai = null;
+    if (text) { try { ai = JSON.parse(text).ai; } catch { return null; } }
+    let auto = false;
+    let providers = !ai ? [] : Array.isArray(ai.providers)
       ? ai.providers
       : (Array.isArray(ai.models) ? ai.models : [ai]).filter((m) => m && m.model).map((m) => ({ ...m, model: m.model }));
-    providers = providers.filter((p) => p && p.provider).map((p) => ({ ...p, name: p.name ?? p.label ?? p.provider }));
-    if (!providers.length) return null;
+    providers = providers.filter((p) => p && p.provider).map((p) => {
+      // "pi" was a provider of its own before agents were a thing.
+      const agent = p.agent ?? (p.provider === "pi" ? "pi" : null);
+      const kind = p.provider === "pi" ? "agent" : p.provider;
+      return { ...p, provider: kind, ...(agent ? { agent } : {}), name: p.name ?? p.label ?? AGENT_CLI[agent]?.name ?? p.provider };
+    });
+    if (!providers.length) {
+      // Nothing configured: offer the agents already installed and logged in. No key, no file, nothing to write.
+      const installed = await knownAgents({}).catch(() => []);
+      providers = installed.filter((a) => a.installed && AGENT_CLI[a.key]).map((a) => ({ name: a.name, provider: "agent", agent: a.key, auto: true }));
+      if (!providers.length) return null;
+      auto = true; ai = { providers };
+    }
     // The choice from the menu (shared state) wins over settings.json's default.
     let selected = null;
     try {
       const stored = JSON.parse(shared("ai-commit.selected") ?? "null");
       if (stored && providers.some((p) => p.name === stored.provider)) selected = { provider: stored.provider, model: stored.model ?? null };
     } catch {}
-    const d = ai.default;
+    const d = ai?.default;
     if (!selected && d && typeof d === "object" && providers.some((p) => p.name === d.provider)) selected = { provider: d.provider, model: d.model ?? null };
     if (!selected && typeof d === "string" && providers.some((p) => p.name === d)) selected = { provider: d, model: providers.find((p) => p.name === d).model ?? null };
     if (!selected) selected = { provider: providers[0].name, model: providers[0].model ?? null };
-    return { providers, selected };
+    return { providers, selected, auto };
   }
 
   // Asks the AI configured in settings.json for one Conventional Commits subject line
@@ -205,16 +233,18 @@ export default class Changes extends View {
     cx.spawn(async (cx) => {
       try {
         const cfg = await this.readAiConfig();
-        if (!cfg) throw new Error('no AI configured: add "ai": {"default": {"provider": "…", "model": "…"}, "providers": [{"name": "…", "provider": "anthropic"|"openai"|"ollama"|"pi"}]} to settings.json');
+        if (!cfg) throw new Error('no AI configured: leave out "ai" to use the agents you already have, or add "ai": {"providers": [{"name": "Claude Code", "provider": "agent", "agent": "claude"}]} to settings.json');
         const p = cfg.providers.find((x) => x.name === cfg.selected.provider);
         const model = cfg.selected.model;
-        if (!p || !model) throw new Error("no model selected: open the model menu next to the sparkles button");
+        if (!p || (!p.model && p.provider !== "agent" && !model)) throw new Error("no model selected: open the model menu next to the sparkles button");
         const ai = { ...p, model };
         const { diff, truncated } = await this.readDiff(root, on);
-        let subject = await this.askAi(ai, diff);
+        // An agent takes the prompt as an argument, so it has to fit a command line.
+        const cut = p.provider === "agent" && diff.length > AGENT_PROMPT_LIMIT, text = cut ? diff.slice(0, AGENT_PROMPT_LIMIT) : diff;
+        let subject = await this.askAi(ai, text);
         // The model does not always respect the length limit: ask once more for a shorter one.
         if (subject.length > 50) {
-          const shorter = await this.askAi(ai, diff, `Your previous answer was ${subject.length} characters. Reply with a shorter subject, at most 50 characters.`).catch(() => "");
+          const shorter = await this.askAi(ai, text, `Your previous answer was ${subject.length} characters. Reply with a shorter subject, at most 50 characters.`).catch(() => "");
           if (shorter) subject = shorter;
         }
         // The repository may have changed, or the request given up on, while the model was answering.
@@ -223,6 +253,7 @@ export default class Changes extends View {
         this.input.set_value(subject); this.message = subject;
         const notes = [];
         if (truncated) notes.push("Diff truncated to 60,000 characters for the AI.");
+        if (cut) notes.push(`Diff truncated to ${AGENT_PROMPT_LIMIT.toLocaleString()} characters for the agent.`);
         if (subject.length > 50) notes.push(`Subject is ${subject.length} characters (50 recommended).`);
         this.note = notes.length ? notes.join(" ") : null; this.noteError = false;
       } catch (e) { if (id === this.genId && this.root === root) { this.note = `AI commit message failed: ${e}`; this.noteError = true; } }
@@ -290,30 +321,29 @@ export default class Changes extends View {
     return line.replace(/^[\"'`]+|[\"'`]+$/g, "").replace(/\.$/, "").trim();
   }
 
-  // pi ships as a shim on Windows (pi.cmd); a direct spawn looks for pi.exe only.
-  async runPi(args, options) {
-    try { return await exec("pi", args, options); }
+  // Windows installs several agent CLIs as .cmd shims: a direct spawn looks for .exe only, and a batch
+  // file cannot carry a line break in its arguments, so the shim gets the prompt on one line.
+  async runCli(command, args, options) {
+    try { return await exec(command, args, options); }
     catch (e) {
       if (!/program not found/i.test(String(e))) throw e;
-      try { return await exec("pi.cmd", args, options); } catch { throw e; }
+      const flat = args.map((a) => (typeof a === "string" && a.includes(NL) ? a.split(NL).join(" ⏎ ") : a));
+      try { return await exec(`${command}.cmd`, flat, options); } catch { throw e; }
     }
   }
 
   async callModel(ai, system, user) {
-    if (ai.provider === "pi") {
-      // Runs pi non-interactively with its own configured model and login (e.g. an Anthropic subscription).
-      // The request goes in a file (pi reads @files), so long diffs don't hit the command-line limit.
-      const dir = `${appHome()}/data/ai-commit`;
-      await fs.mkdir(dir, { recursive: true });
-      const file = `${dir}/request.txt`;
-      await fs.writeFile(file, `${system}\n\n${user}`, "utf8");
-      try {
-        const r = await this.runPi(["-p", "--no-session", "--no-tools", "--no-context-files", "--model", ai.model, "Answer the request in the attached file. Reply with only the commit subject line.", `@${file}`], { timeout: 240000 });
-        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 200) || `pi exited with code ${r.code}`);
-        return r.stdout;
-      } finally {
-        await fs.rm(file, { force: true }).catch(() => {});
-      }
+    if (ai.provider === "agent") {
+      // An agent CLI that is already logged in, in its non-interactive mode: no key, no session, no tools.
+      // The prompt is one argument, so it must fit a command line (generateMessage trims the diff).
+      const prompt = `${system}\n\n${user}`;
+      const spec = ai.command ? null : AGENT_CLI[ai.agent];
+      if (!ai.command && !spec) throw new Error(`unknown agent "${ai.agent}": known are ${Object.keys(AGENT_CLI).join(", ")}; set "command" for anything else`);
+      const command = ai.command ? String(ai.command[0]) : ai.agent;
+      const args = ai.command ? [...ai.command.slice(1).map(String), prompt] : spec.print(prompt, ai.model || "");
+      const r = await this.runCli(command, args, { timeout: 240000 });
+      if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout) || `${command} exited with code ${r.code}`);
+      return r.stdout;
     }
     const messages = [{ role: "system", content: system }, { role: "user", content: user }];
     if (ai.provider === "anthropic") {
@@ -379,7 +409,10 @@ export default class Changes extends View {
       const cfg = await this.readAiConfig();
       this.providers = cfg?.providers ?? [];
       this.selected = cfg?.selected ?? null;
-      const label = this.selected?.model ?? null;
+      this.auto = cfg?.auto ?? false;
+      const p = this.providers.find((x) => x.name === this.selected?.provider);
+      // An agent shows its own name; a plain API provider shows the model.
+      const label = this.selected?.model || p?.name || null;
       if (label !== this.modelName) { this.modelName = label; cx.notify(); }
     });
   }
@@ -411,10 +444,15 @@ export default class Changes extends View {
 
   async fetchModels(p) {
     if (p.model) return [p.model];
-    if (p.provider === "pi") {
-      // pi's own model list ("provider/model"): its logins and keys are used, nothing is read here.
-      const r = await this.runPi(["--list-models"], { timeout: 60000 });
-      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 160) || "pi --list-models failed");
+    if (p.provider === "agent") {
+      // An agent asks its own CLI for its models when it has such a command; otherwise it has one entry,
+      // the model it is already set up with (null: pass no --model at all).
+      const spec = p.command ? null : AGENT_CLI[p.agent];
+      if (!p.command && !spec) throw new Error(`unknown agent "${p.agent}": known are ${Object.keys(AGENT_CLI).join(", ")}; set "command" for anything else`);
+      if (!spec?.list) return [null];
+      const r = await this.runCli(p.agent, spec.list, { timeout: 60000 });
+      if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout) || `${p.agent} ${spec.list.join(" ")} failed`);
+      // "provider/model", one per row after the header.
       return r.stdout.split("\n").slice(1).map((l) => l.trim().split(/\s+/)).filter((t) => t.length >= 2).map(([prov, model]) => `${prov}/${model}`);
     }
     const base = (u) => String(u).replace(/\/$/, "");
@@ -449,13 +487,14 @@ export default class Changes extends View {
   pickModel(provider, model, cx) {
     setShared("ai-commit.selected", JSON.stringify({ provider, model }));
     this.selected = { provider, model };
-    this.modelName = model;
+    this.modelName = model || provider;
     this.menuOpen = false;
     cx.notify();
   }
 
   modelMenu(t) {
     const rows = [], providers = this.providers ?? [];
+    if (this.auto) rows.push(div().px(10).pt(6).pb(2).text_size(10).text_color(t.dim).child('No "ai" in settings.json: the agents you already have'));
     for (const p of providers) {
       rows.push(div().px(10).pt(8).pb(2).text_size(10).text_color(t.dim).font_semibold().child(p.name.toUpperCase()));
       const entry = this.catalog?.[p.name];
@@ -463,11 +502,11 @@ export default class Changes extends View {
       else if (entry.error) rows.push(div().px(10).py(4).text_size(11).text_color(t.ansi1).child(entry.error));
       else if (!entry.models.length) rows.push(div().px(10).py(4).text_size(11).text_color(t.dim).child("no models"));
       else for (const m of entry.models) {
-        const on = this.selected?.provider === p.name && this.selected?.model === m;
+        const on = this.selected?.provider === p.name && (this.selected?.model ?? null) === (m ?? null);
         rows.push(h_flex().id(`model-${p.name}-${m}`).h(26).px(10).gap(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover)).when(on, (e) => e.bg(t.selected))
           .on_click((_e, cx) => this.pickModel(p.name, m, cx))
           .child(div().w(12).text_color(t.accent).child(on ? "✓" : ""))
-          .child(div().flex_1().min_w(0).truncate().child(m)));
+          .child(div().flex_1().min_w(0).truncate().child(m ?? "default (its own model)")));
       }
     }
     if (!providers.length) rows.push(div().px(10).py(6).text_size(11).text_color(t.dim).child('No providers: add an "ai" section to settings.json'));
