@@ -1,7 +1,7 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import * as fs from "fs/promises";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, home, shared, setShared, nextCommand } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, shared, setShared, nextCommand } from "herdr";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -15,6 +15,9 @@ const key = () => JSON.stringify(location());
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 
+// Text draws a tab as nothing: pad each to the next 4-column stop.
+const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
+
 // Numbers each diff line once, so a frame only draws the rows on screen.
 function diffRows(lines) {
   let old = 0, next = 0;
@@ -22,9 +25,9 @@ function diffRows(lines) {
     const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
     if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
     const kind = line[0];
-    if (kind === "-") return { kind, number: old++, text: line.slice(1) || " " };
-    if (kind === "+") return { kind, number: next++, text: line.slice(1) || " " };
-    if (kind === " ") { old++; return { kind, number: next++, text: line.slice(1) || " " }; }
+    if (kind === "-") return { kind, number: old++, text: untab(line.slice(1)) || " " };
+    if (kind === "+") return { kind, number: next++, text: untab(line.slice(1)) || " " };
+    if (kind === " ") { old++; return { kind, number: next++, text: untab(line.slice(1)) || " " }; }
     return { kind: "", text: line };
   });
 }
@@ -45,7 +48,13 @@ export default class Changes extends View {
     this.loadModelLabel(cx);
     // Local: refresh every 10 s. Remote: every 30 s, since each refresh runs Git over SSH.
     this.ticks = 0;
-    cx.timer.every(10000, (cx) => { this.ticks++; if (!this.on || this.ticks % 3 === 0) this.refresh(cx); this.loadModelLabel(cx); });
+    cx.timer.every(10000, (cx) => {
+      this.ticks++;
+      // A request that never answers must not leave the sparkles button spinning forever.
+      if (this.generating && Date.now() - this.genAt > 180000) { this.genId++; this.generating = false; this.note = "AI: no reply after 3 minutes"; this.noteError = true; }
+      if (!this.on || this.ticks % 3 === 0) this.refresh(cx);
+      this.loadModelLabel(cx);
+    });
     // Keyboard: keys.json → "mod:ai-commit": { "ctrl-alt-g": "ai-commit.generate" }
     cx.spawn(async (cx) => { for (;;) { const c = await nextCommand(); if (c === "generate") this.generateMessage(cx); cx.notify(); } });
   }
@@ -139,7 +148,7 @@ export default class Changes extends View {
 
   setLines(lines) {
     this.rows = diffRows(lines);
-    this.diffWidth = Math.max(300, ...lines.map(line => line.length * 7 + 50));
+    this.diffWidth = Math.max(300, ...this.rows.map(row => (row.text.length + 1) * 7 + 50));
   }
 
   pick(path, cx) {
@@ -173,7 +182,7 @@ export default class Changes extends View {
     // The choice from the menu (shared state) wins over settings.json's default.
     let selected = null;
     try {
-      const stored = JSON.parse(shared("ai.selected") ?? "null");
+      const stored = JSON.parse(shared("ai-commit.selected") ?? "null");
       if (stored && providers.some((p) => p.name === stored.provider)) selected = { provider: stored.provider, model: stored.model ?? null };
     } catch {}
     const d = ai.default;
@@ -187,14 +196,16 @@ export default class Changes extends View {
   // for the staged diff (or the diff against HEAD when nothing is staged), and fills the box.
   generateMessage(cx) {
     if (this.generating) return;
-    if (!this.root) { this.note = "AI: no repository loaded yet"; cx.notify(); return; }
-    if (this.busy) { this.note = "AI: a commit is in progress"; cx.notify(); return; }
+    if (!this.root) { this.note = "AI: no repository loaded yet"; this.noteError = true; cx.notify(); return; }
+    if (this.busy) { this.note = "AI: a commit is in progress"; this.noteError = true; cx.notify(); return; }
     const root = this.root, on = this.on;
-    this.generating = true; this.note = "AI: generating commit message…";
+    // One id per request: the timer gives up on a request that never answers, and a late reply is dropped.
+    const id = this.genId = (this.genId ?? 0) + 1;
+    this.generating = true; this.genAt = Date.now(); this.note = "AI: generating commit message…"; this.noteError = false;
     cx.spawn(async (cx) => {
       try {
         const cfg = await this.readAiConfig();
-        if (!cfg) throw new Error('no AI configured: set settings.json → "ai": {"models": [{"label": "…", "provider": "anthropic"|"openai"|"ollama", "model": "…"}]}');
+        if (!cfg) throw new Error('no AI configured: add "ai": {"default": {"provider": "…", "model": "…"}, "providers": [{"name": "…", "provider": "anthropic"|"openai"|"ollama"|"pi"}]} to settings.json');
         const p = cfg.providers.find((x) => x.name === cfg.selected.provider);
         const model = cfg.selected.model;
         if (!p || !model) throw new Error("no model selected: open the model menu next to the sparkles button");
@@ -206,21 +217,22 @@ export default class Changes extends View {
           const shorter = await this.askAi(ai, diff, `Your previous answer was ${subject.length} characters. Reply with a shorter subject, at most 50 characters.`).catch(() => "");
           if (shorter) subject = shorter;
         }
-        // The repository may have changed while the model was answering: drop the result then.
-        if (this.root !== root) return;
-        if (!subject) { this.note = "AI returned an empty message"; return; }
+        // The repository may have changed, or the request given up on, while the model was answering.
+        if (id !== this.genId || this.root !== root) return;
+        if (!subject) { this.note = "AI returned an empty message"; this.noteError = true; return; }
         this.input.set_value(subject); this.message = subject;
         const notes = [];
         if (truncated) notes.push("Diff truncated to 60,000 characters for the AI.");
         if (subject.length > 50) notes.push(`Subject is ${subject.length} characters (50 recommended).`);
-        this.note = notes.length ? notes.join(" ") : null;
-      } catch (e) { if (this.root === root) this.note = `AI commit message failed: ${e}`; }
-      finally { this.generating = false; cx.notify(); }
+        this.note = notes.length ? notes.join(" ") : null; this.noteError = false;
+      } catch (e) { if (id === this.genId && this.root === root) { this.note = `AI commit message failed: ${e}`; this.noteError = true; } }
+      finally { if (id === this.genId) { this.generating = false; cx.notify(); } }
     });
     cx.notify();
   }
 
   // Staged diff; if nothing is staged, the diff against HEAD (what Commit will stage with git add -A).
+  // Neither includes untracked files, which Commit does commit, so those are added separately.
   async readDiff(root, on) {
     const r = await exec("git", [...READ, "diff", "--staged", "--no-color"], { cwd: root, on });
     if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "git diff --staged failed");
@@ -230,9 +242,29 @@ export default class Changes extends View {
       if (w.code !== 0) throw new Error((w.stderr || w.stdout).trim() || "git diff HEAD failed");
       diff = w.stdout.trim();
     }
-    if (!diff) throw new Error("no changes to summarize (nothing staged or modified)");
+    const fresh = await this.untracked(root, on);
+    if (fresh) diff = diff ? `${diff}\n${fresh}` : fresh;
+    if (!diff) throw new Error("no changes to summarize (nothing staged, modified or untracked)");
     const LIMIT = 60000;
     return { diff: diff.slice(0, LIMIT), truncated: diff.length > LIMIT };
+  }
+
+  // The untracked files as text for the model. Bounded, since all of it goes in one prompt.
+  async untracked(root, on) {
+    const status = await exec("git", [...READ, "status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: root, on }).catch(() => null);
+    if (!status || status.code !== 0) return "";
+    const paths = status.stdout.split("\0").filter((e) => e.startsWith("?? ")).map((e) => e.slice(3));
+    const out = [];
+    let budget = 20000;
+    for (const path of paths) {
+      if (budget <= 0) { out.push(`new file: ${path} (not shown)`); continue; }
+      const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
+      if (text === null || text.includes("\0")) { out.push(`new file: ${path} (binary or unreadable, not shown)`); continue; }
+      const lines = text.replace(/\n$/, "").split("\n"), body = lines.slice(0, 400).join("\n"), shown = body.slice(0, budget);
+      budget -= shown.length;
+      out.push(`new file: ${path} (${lines.length} lines, added by Commit)\n${shown.split("\n").map((l) => `+${l}`).join("\n")}${shown.length < body.length ? "\n+… (rest not shown)" : ""}`);
+    }
+    return out.join("\n");
   }
 
   // The API key for a model: "api_key" in settings.json, or the environment variable named by "api_key_env".
@@ -326,7 +358,7 @@ export default class Changes extends View {
           if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         }
         if (key() === context) { this.message = ""; this.input.set_value(""); }
-      } catch (e) { if (key() === context) this.note = `Commit failed: ${e}`; }
+      } catch (e) { if (key() === context) { this.note = `Commit failed: ${e}`; this.noteError = true; } }
       finally { this.busy = false; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
@@ -349,21 +381,23 @@ export default class Changes extends View {
 
   toggleMenu(cx) {
     this.menuOpen = !this.menuOpen;
-    if (this.menuOpen) cx.spawn(async (cx) => { await this.loadCatalog(); cx.notify(); });
+    if (this.menuOpen) cx.spawn(async (cx) => { await this.loadCatalog(cx); cx.notify(); });
     cx.notify();
   }
 
-  // Lists each provider's models once per session; errors are shown in the menu.
-  async loadCatalog() {
+  // Lists each provider's models once per session; errors are shown in the menu, provider by provider.
+  async loadCatalog(cx) {
     const cfg = await this.readAiConfig();
     if (!cfg) return;
     this.providers = cfg.providers; this.selected = cfg.selected;
     this.catalog = this.catalog ?? {};
-    for (const p of cfg.providers) {
-      if (this.catalog[p.name]) continue;
+    // In parallel: one unreachable server must not hold up the others' lists.
+    await Promise.all(cfg.providers.map(async (p) => {
+      if (this.catalog[p.name]) return;
       try { this.catalog[p.name] = { models: await this.fetchModels(p) }; }
       catch (e) { this.catalog[p.name] = { error: String(e).slice(0, 160) }; }
-    }
+      cx.notify();
+    }));
   }
 
   async fetchModels(p) {
@@ -403,8 +437,8 @@ export default class Changes extends View {
     throw new Error(`unknown provider "${p.provider}"`);
   }
 
-  pick(provider, model, cx) {
-    setShared("ai.selected", JSON.stringify({ provider, model }));
+  pickModel(provider, model, cx) {
+    setShared("ai-commit.selected", JSON.stringify({ provider, model }));
     this.selected = { provider, model };
     this.modelName = model;
     this.menuOpen = false;
@@ -412,8 +446,8 @@ export default class Changes extends View {
   }
 
   modelMenu(t) {
-    const rows = [];
-    for (const p of this.providers ?? []) {
+    const rows = [], providers = this.providers ?? [];
+    for (const p of providers) {
       rows.push(div().px(10).pt(8).pb(2).text_size(10).text_color(t.dim).font_semibold().child(p.name.toUpperCase()));
       const entry = this.catalog?.[p.name];
       if (!entry) rows.push(div().px(10).py(4).text_size(11).text_color(t.dim).child("loading…"));
@@ -422,12 +456,15 @@ export default class Changes extends View {
       else for (const m of entry.models) {
         const on = this.selected?.provider === p.name && this.selected?.model === m;
         rows.push(h_flex().id(`model-${p.name}-${m}`).h(26).px(10).gap(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover)).when(on, (e) => e.bg(t.selected))
-          .on_click((_e, cx) => this.pick(p.name, m, cx))
+          .on_click((_e, cx) => this.pickModel(p.name, m, cx))
           .child(div().w(12).text_color(t.accent).child(on ? "✓" : ""))
           .child(div().flex_1().min_w(0).truncate().child(m)));
       }
     }
-    return v_flex().id("model-menu").absolute().right(10).bottom(54).w(300).max_h(360).overflow_y_scroll().py(4).rounded(8).border_1().border_color(t.border).bg(t.popover).children(rows);
+    if (!providers.length) rows.push(div().px(10).py(6).text_size(11).text_color(t.dim).child('No providers: add an "ai" section to settings.json'));
+    // The menu lives inside the panel (clipped by its overflow), so size it to the panel.
+    const h = Math.max(160, Math.min(360, (this.panelH ?? 620) - 70)), w = Math.max(140, Math.min(300, (this.panelW ?? 320) - 20));
+    return v_flex().id("model-menu").absolute().right(10).bottom(54).w(w).max_h(h).overflow_y_scroll().py(4).rounded(8).border_1().border_color(t.border).bg(t.popover).children(rows);
   }
 
   diffRow({ kind, number, text }, t) {
@@ -441,8 +478,9 @@ export default class Changes extends View {
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
-    return v_flex().id("changes").size_full().relative().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+    return v_flex().id("changes").size_full().on_size_change((size, cx) => { if (size.width !== this.panelW || size.height !== this.panelH) { this.panelW = size.width; this.panelH = size.height; if (this.menuOpen) cx.notify(); } }).relative().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
+        if (e.key === "escape" && this.menuOpen) { this.menuOpen = false; cx.stop_propagation(); cx.notify(); return; }
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
       })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
@@ -466,7 +504,7 @@ export default class Changes extends View {
             (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
         .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
         .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes"))))
-      .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
+      .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(this.noteError ? t.ansi1 : t.muted).child(this.note)))
       .when(this.menuOpen, (e) => e.child(this.modelMenu(t)))
       .child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
         .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
