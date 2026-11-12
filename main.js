@@ -155,18 +155,31 @@ export default class Changes extends View {
 
   // settings() only exposes the app's look and zoom/sounds, not the raw file,
   // so the ai section is read straight from settings.json in the app home.
-  // settings.json → "ai": { "default": "<label>", "models": [ { "label", "provider", "model", "base_url"?, "api_key"? } ] }
-  // A single { provider, model, ... } object (no models list) also works.
+  // settings.json → "ai": { "default": {"provider", "model"}, "providers": [ { "name", "provider", "base_url"?, "api_key"?, "api_key_env"?, "model"? } ] }
+  // Without "model", a provider's models are listed from its API (Anthropic, OpenAI-compatible, Ollama).
+  // The old format ("models": [{label, provider, model}] or one object) still works.
   async readAiConfig() {
     const text = await readTextFile(`${appHome()}/settings.json`).catch(() => null);
     if (!text) return null;
     let ai;
     try { ai = JSON.parse(text).ai; } catch { return null; }
     if (!ai) return null;
-    const list = (Array.isArray(ai.models) ? ai.models : [ai]).filter((m) => m && m.model);
-    if (!list.length) return null;
-    const chosen = list.find((m) => m.label === shared("ai.model")) ?? list.find((m) => m.label === ai.default) ?? list[0];
-    return { list, chosen };
+    let providers = Array.isArray(ai.providers)
+      ? ai.providers
+      : (Array.isArray(ai.models) ? ai.models : [ai]).filter((m) => m && m.model).map((m) => ({ ...m, model: m.model }));
+    providers = providers.filter((p) => p && p.provider).map((p) => ({ ...p, name: p.name ?? p.label ?? p.provider }));
+    if (!providers.length) return null;
+    // The choice from the menu (shared state) wins over settings.json's default.
+    let selected = null;
+    try {
+      const stored = JSON.parse(shared("ai.selected") ?? "null");
+      if (stored && providers.some((p) => p.name === stored.provider)) selected = { provider: stored.provider, model: stored.model ?? null };
+    } catch {}
+    const d = ai.default;
+    if (!selected && d && typeof d === "object" && providers.some((p) => p.name === d.provider)) selected = { provider: d.provider, model: d.model ?? null };
+    if (!selected && typeof d === "string" && providers.some((p) => p.name === d)) selected = { provider: d, model: providers.find((p) => p.name === d).model ?? null };
+    if (!selected) selected = { provider: providers[0].name, model: providers[0].model ?? null };
+    return { providers, selected };
   }
 
   // Asks the AI configured in settings.json for one Conventional Commits subject line
@@ -181,7 +194,10 @@ export default class Changes extends View {
       try {
         const cfg = await this.readAiConfig();
         if (!cfg) throw new Error('no AI configured: set settings.json → "ai": {"models": [{"label": "…", "provider": "anthropic"|"openai"|"ollama", "model": "…"}]}');
-        const ai = cfg.chosen;
+        const p = cfg.providers.find((x) => x.name === cfg.selected.provider);
+        const model = cfg.selected.model;
+        if (!p || !model) throw new Error("no model selected: open the model menu next to the sparkles button");
+        const ai = { ...p, model };
         const { diff, truncated } = await this.readDiff(root, on);
         let subject = await this.askAi(ai, diff);
         // The model does not always respect the length limit: ask once more for a shorter one.
@@ -298,29 +314,90 @@ export default class Changes extends View {
     cx.notify();
   }
 
-  // Label of the model the button uses. Re-read on every timer tick, so edits to settings.json show up.
+  // The model name on the button. Re-read on every timer tick, so edits to settings.json show up.
   loadModelLabel(cx) {
     cx.spawn(async (cx) => {
       const cfg = await this.readAiConfig();
-      const label = cfg ? (cfg.chosen.label ?? cfg.chosen.model) : null;
+      this.providers = cfg?.providers ?? [];
+      this.selected = cfg?.selected ?? null;
+      const label = this.selected?.model ?? null;
       if (label !== this.modelName) { this.modelName = label; cx.notify(); }
     });
   }
 
   modelLabel() {
-    return this.modelName ?? "AI model";
+    return this.modelName ?? "Choose model";
   }
 
-  cycleModel(cx) {
-    cx.spawn(async (cx) => {
-      const cfg = await this.readAiConfig();
-      if (!cfg) { this.note = 'AI: no models in settings.json → "ai"'; cx.notify(); return; }
-      const i = cfg.list.indexOf(cfg.chosen);
-      const next = cfg.list[(i + 1) % cfg.list.length];
-      setShared("ai.model", next.label);
-      this.modelName = next.label;
-      cx.notify();
-    });
+  toggleMenu(cx) {
+    this.menuOpen = !this.menuOpen;
+    if (this.menuOpen) cx.spawn(async (cx) => { await this.loadCatalog(); cx.notify(); });
+    cx.notify();
+  }
+
+  // Lists each provider's models once per session; errors are shown in the menu.
+  async loadCatalog() {
+    const cfg = await this.readAiConfig();
+    if (!cfg) return;
+    this.providers = cfg.providers; this.selected = cfg.selected;
+    this.catalog = this.catalog ?? {};
+    for (const p of cfg.providers) {
+      if (this.catalog[p.name]) continue;
+      try { this.catalog[p.name] = { models: await this.fetchModels(p) }; }
+      catch (e) { this.catalog[p.name] = { error: String(e).slice(0, 160) }; }
+    }
+  }
+
+  async fetchModels(p) {
+    if (p.model) return [p.model];
+    const base = (u) => String(u).replace(/\/$/, "");
+    if (p.provider === "anthropic") {
+      const key = await this.apiKey(p);
+      if (!key) throw new Error('no API key (set "api_key" or "api_key_env")');
+      const res = await fetch("https://api.anthropic.com/v1/models?limit=100", { headers: { "anthropic-version": "2023-06-01", "x-api-key": key } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return ((await res.json()).data ?? []).map((m) => m.id);
+    }
+    if (p.provider === "openai") {
+      const key = await this.apiKey(p);
+      const res = await fetch(`${base(p.base_url || "https://api.openai.com/v1")}/models`, { headers: key ? { authorization: `Bearer ${key}` } : {} });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return ((await res.json()).data ?? []).map((m) => m.id);
+    }
+    if (p.provider === "ollama") {
+      const res = await fetch(`${base(p.base_url || "http://127.0.0.1:11434")}/api/tags`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Embedding models can't write messages: leave them out.
+      return ((await res.json()).models ?? []).map((m) => m.name).filter((n) => !/embed/i.test(n));
+    }
+    throw new Error(`unknown provider "${p.provider}"`);
+  }
+
+  pick(provider, model, cx) {
+    setShared("ai.selected", JSON.stringify({ provider, model }));
+    this.selected = { provider, model };
+    this.modelName = model;
+    this.menuOpen = false;
+    cx.notify();
+  }
+
+  modelMenu(t) {
+    const rows = [];
+    for (const p of this.providers ?? []) {
+      rows.push(div().px(10).pt(8).pb(2).text_size(10).text_color(t.dim).font_semibold().child(p.name.toUpperCase()));
+      const entry = this.catalog?.[p.name];
+      if (!entry) rows.push(div().px(10).py(4).text_size(11).text_color(t.dim).child("loading…"));
+      else if (entry.error) rows.push(div().px(10).py(4).text_size(11).text_color(t.ansi1).child(entry.error));
+      else if (!entry.models.length) rows.push(div().px(10).py(4).text_size(11).text_color(t.dim).child("no models"));
+      else for (const m of entry.models) {
+        const on = this.selected?.provider === p.name && this.selected?.model === m;
+        rows.push(h_flex().id(`model-${p.name}-${m}`).h(26).px(10).gap(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover)).when(on, (e) => e.bg(t.selected))
+          .on_click((_e, cx) => this.pick(p.name, m, cx))
+          .child(div().w(12).text_color(t.accent).child(on ? "✓" : ""))
+          .child(div().flex_1().min_w(0).truncate().child(m)));
+      }
+    }
+    return v_flex().id("model-menu").absolute().right(10).bottom(54).w(300).max_h(360).overflow_y_scroll().py(4).rounded(8).border_1().border_color(t.border).bg(t.popover).children(rows);
   }
 
   diffRow({ kind, number, text }, t) {
@@ -334,7 +411,7 @@ export default class Changes extends View {
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
-    return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+    return v_flex().id("changes").size_full().relative().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
       })
@@ -360,10 +437,12 @@ export default class Changes extends View {
         .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
         .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes"))))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
+      .when(this.menuOpen, (e) => e.child(this.modelMenu(t)))
       .child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
         .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
-        .child(div().id("commit-model").h(32).px(8).flex().items_center().rounded(8).border_1().border_color(t.border).text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("AI model for commit messages (click to change)")
-          .on_click((_e, cx) => this.cycleModel(cx)).child(div().max_w(96).truncate().child(this.modelLabel())))
+        .child(h_flex().id("commit-model").h(32).px(10).gap(6).items_center().rounded(8).border_1().border_color(this.menuOpen ? t.accent : t.border).text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Model for commit messages: click to choose")
+          .on_click((_e, cx) => this.toggleMenu(cx))
+          .child(div().max_w(110).truncate().child(this.modelLabel())).child(div().text_size(9).child("▾")))
         .child(div().id("commit-ai").h(32).w(32).flex().items_center().justify_center().rounded(8).border_1().border_color(this.generating ? t.accent : t.border).text_color(this.generating ? t.accent : t.muted).tooltip("Generate commit message from staged changes with AI")
           .when(!this.generating, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)))
           .on_click((_e, cx) => this.generateMessage(cx))

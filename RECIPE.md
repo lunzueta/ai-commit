@@ -9,7 +9,7 @@ A Changes panel for Herdr with an AI button for the commit message. It shows the
 **How it behaves:**
 - The file list and diff refresh when the folder changes and every 10 seconds (every 30 seconds on remote spaces, since each refresh runs Git over SSH).
 - Clicking a file shows its diff; clicking it again hides it. The first file is shown by default.
-- Model button: click to switch to the next model in `settings.json`. The choice is kept in shared state (`ai.model`) and shown again when the panel opens.
+- Model button (the name with ▾): opens a menu listing the models of every provider in `settings.json`, grouped by provider, with ✓ on the selected one. The lists come from each provider's API (see below), and are loaded once per session. Clicking a model selects it for the commit button; the choice is kept in shared state (`ai.selected`) and shown again when the panel opens.
 - Sparkles button (or the keyboard command below): the button spins and the note line says "AI: generating commit message…". On success the subject appears in the commit box. If the subject is over 50 characters, the mod asks the model once more for a shorter one; if the result is still long, the note says how many characters it has. If the diff is over 60,000 characters, the note says it was truncated.
 - Failures show a reason in the note line: no configuration, missing key, HTTP status, empty reply, no repository.
 - If you switch repositories while a message is generating, the result is dropped.
@@ -34,18 +34,21 @@ A Changes panel for Herdr with an AI button for the commit message. It shows the
 
 ```json
 "ai": {
-  "default": "Local",
-  "models": [
-    { "label": "Haiku",  "provider": "anthropic", "model": "claude-haiku-5-5", "api_key_env": "ANTHROPIC_API_KEY" },
-    { "label": "Local",  "provider": "openai",    "model": "your-model-id", "base_url": "http://localhost:8000/v1" },
-    { "label": "Ollama", "provider": "ollama",    "model": "llama3.2" }
+  "default": { "provider": "Anthropic", "model": "claude-haiku-5-5" },
+  "providers": [
+    { "name": "Anthropic", "provider": "anthropic", "api_key_env": "ANTHROPIC_API_KEY" },
+    { "name": "Local server", "provider": "openai", "base_url": "http://localhost:8000/v1" },
+    { "name": "Ollama", "provider": "ollama" }
   ]
 }
 ```
 
-- `api_key` (in the file) or `api_key_env` (name of an environment variable; the file then holds no secret) for `anthropic`. `openai`-compatible servers take an optional `api_key` the same way. `ollama` needs none.
-- A single `{ "provider", "model", ... }` object without `models` also works.
+- `provider` is the API: `anthropic`, `openai` (any OpenAI-compatible server: OpenAI, SGLang, vLLM, LM Studio…) or `ollama`.
+- The menu lists every model that the provider's API reports: Anthropic's `/v1/models`, `<base_url>/models` for `openai`, and Ollama's local model list (embedding models are left out).
+- To fix the model of a provider instead of listing them, add `"model": "…"` to it; it then shows as the only entry.
+- Keys: `api_key` (in the file) or `api_key_env` (an environment variable name; the file then holds no secret). `ollama` needs none; `openai`-compatible servers take an optional key.
 - Anthropic needs a console API key. This mod does not use any other program's login or token.
+- Older files with `"models": [{label, provider, model}]` still work.
 
 **Watch out:**
 - Keys in `settings.json` are plain text. Prefer `api_key_env`, and don't commit that file.
@@ -57,7 +60,7 @@ A Changes panel for Herdr with an AI button for the commit message. It shows the
 
 **Done when:**
 - `herdr-app check mods/ai-commit` passes.
-- The model button shows the default model from `settings.json` and changes to the next one when clicked.
+- The model button shows the default model from `settings.json`; its menu lists models from each configured provider and the chosen one gets ✓.
 - With a staged change, the sparkles button fills the commit box with a `type(scope): subject` line.
 - With nothing changed, the note line says "no changes to summarize".
 - With an `anthropic` model and no key, the note line says "no Anthropic API key".
