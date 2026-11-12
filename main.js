@@ -1,5 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
+import * as fs from "fs/promises";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, appHome, home, shared, setShared, nextCommand } from "herdr";
 
 function location() {
@@ -258,6 +259,21 @@ export default class Changes extends View {
   }
 
   async callModel(ai, system, user) {
+    if (ai.provider === "pi") {
+      // Runs pi non-interactively with its own configured model and login (e.g. an Anthropic subscription).
+      // The request goes in a file (pi reads @files), so long diffs don't hit the command-line limit.
+      const dir = `${appHome()}/data/ai-commit`;
+      await fs.mkdir(dir, { recursive: true });
+      const file = `${dir}/request.txt`;
+      await fs.writeFile(file, `${system}\n\n${user}`, "utf8");
+      try {
+        const r = await exec("pi", ["-p", "--no-session", "--no-tools", "--no-context-files", "--model", ai.model, "Answer the request in the attached file. Reply with only the commit subject line.", `@${file}`], { timeout: 240000 });
+        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 200) || `pi exited with code ${r.code}`);
+        return r.stdout;
+      } finally {
+        await fs.rm(file, { force: true }).catch(() => {});
+      }
+    }
     const messages = [{ role: "system", content: system }, { role: "user", content: user }];
     if (ai.provider === "anthropic") {
       const key = await this.apiKey(ai);
@@ -352,6 +368,12 @@ export default class Changes extends View {
 
   async fetchModels(p) {
     if (p.model) return [p.model];
+    if (p.provider === "pi") {
+      // pi's own model list ("provider/model"): its logins and keys are used, nothing is read here.
+      const r = await exec("pi", ["--list-models"], { timeout: 60000 });
+      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 160) || "pi --list-models failed");
+      return r.stdout.split("\n").slice(1).map((l) => l.trim().split(/\s+/)).filter((t) => t.length >= 2).map(([prov, model]) => `${prov}/${model}`);
+    }
     const base = (u) => String(u).replace(/\/$/, "");
     if (p.provider === "anthropic") {
       const key = await this.apiKey(p);
