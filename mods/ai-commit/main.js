@@ -12,7 +12,6 @@ const key = () => JSON.stringify(location());
 // Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):
 // the folder watch would see it, and every refresh would start the next one.
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
-const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 
 // Agent CLIs this mod knows how to ask for one line, by their knownAgents() key.
 // print() returns the arguments, prompt last; list (optional) lists their models.
@@ -51,6 +50,20 @@ function keepByFilter(filter, name) {
   return n.length >= a.length + b.length && n.startsWith(a) && n.endsWith(b);
 }
 
+// Breaks a line at word boundaries to 72 characters; continuation lines keep the bullet's indent.
+function wrap72(line) {
+  const indent = /^- /.test(line) ? "  " : "";
+  const out = [];
+  let cur = "";
+  for (const word of line.split(/\s+/)) {
+    const next = cur ? cur + " " + word : word;
+    if (next.length > 72 && cur) { out.push(cur); cur = indent + word; }
+    else cur = next;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 // The body under the subject line: the lines after the last subject-shaped line, bullets kept,
 // labels dropped, at most 6 lines of 72 characters. Empty when the model gave none.
 function pickBody(raw, subject) {
@@ -59,9 +72,14 @@ function pickBody(raw, subject) {
   let at = -1;
   lines.forEach((l, i) => { if (norm(l) === subject) at = i; });
   if (at < 0) return "";
-  return lines.slice(at + 1)
-    .filter((l) => l && !/^```/.test(l) && !/^[-*]?\s*(body|footer|subject)\s*:/i.test(l))
-    .slice(0, 6).map((l) => (l.length > 72 ? l.slice(0, 72) : l)).join(NL).trim();
+  // A bullet the model wrapped continues on the next line: join those first, then count bullets, not lines.
+  const items = [];
+  for (const l of lines.slice(at + 1)) {
+    if (!l || /^```/.test(l) || /^[-*]?\s*(body|footer|subject)\s*:/i.test(l)) continue;
+    if (/^[-*]\s/.test(l) || !items.length) items.push(l);
+    else items[items.length - 1] += " " + l;
+  }
+  return items.slice(0, 6).flatMap((l) => wrap72(l)).join(NL).trim();
 }
 
 // The subject out of whatever a model printed: a Conventional Commits line if there is one
@@ -86,26 +104,10 @@ function pickSubject(raw) {
 // A batch file (.cmd) cannot carry a line break in its arguments: the shim gets one line, marked.
 const NL = String.fromCharCode(10);
 
-// Text draws a tab as nothing: pad each to the next 4-column stop.
-const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
-
-// Numbers each diff line once, so a frame only draws the rows on screen.
-function diffRows(lines) {
-  let old = 0, next = 0;
-  return lines.map((line) => {
-    const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
-    if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
-    const kind = line[0];
-    if (kind === "-") return { kind, number: old++, text: untab(line.slice(1)) || " " };
-    if (kind === "+") return { kind, number: next++, text: untab(line.slice(1)) || " " };
-    if (kind === " ") { old++; return { kind, number: next++, text: untab(line.slice(1)) || " " }; }
-    return { kind: "", text: line };
-  });
-}
 
 export default class Changes extends View {
   init(_props, cx) {
-    this.files = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.generating = false; this.handle = cx.focus_handle();
+    this.files = []; this.message = ""; this.generating = false; this.handle = cx.focus_handle();
     // Multi-line: a subject, a blank line and a body. Enter is a new line; the Commit button commits.
     this.input = EditorState.new({ language: "text", line_numbers: false, folding: false, soft_wrap: true, font_size: 12 });
     this.input.on("change", (_e, cx) => {
@@ -147,8 +149,8 @@ export default class Changes extends View {
     if (this.loading || this.busy) return;
     const { cwd, on } = location(), context = key();
     if (context !== this.context) {
-      this.context = context; this.root = null; this.files = []; this.open = null;
-      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
+      this.context = context; this.root = null; this.files = [];
+      this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.limited = false;
     }
     if (!cwd) return;
     this.loading = true;
@@ -156,82 +158,32 @@ export default class Changes extends View {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
         if (key() !== context) return;
-        if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
+        if (top.code !== 0) { this.root = null; this.files = []; this.error = "Not a git repository"; return; }
         const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
         const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
         if (status.code !== 0) throw new Error(status.stderr);
-        const head = await git(["rev-parse", "--verify", "HEAD"]);
+        const stat = await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]);
+        if (stat.code !== 0) throw new Error(stat.stderr);
         const stats = {};
-        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
-        for (const result of results) {
-          if (result.code !== 0) throw new Error(result.stderr);
-          for (const entry of result.stdout.split("\0")) {
-            const [a, d, ...parts] = entry.split("\t");
-            if (!parts.length) continue;
-            const path = parts.join("\t"), old = stats[path] ?? { add: 0, del: 0 };
-            stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
-          }
+        for (const entry of stat.stdout.split("\0")) {
+          const [a, d, ...parts] = entry.split("\t");
+          if (parts.length) stats[parts.join("\t")] = { add: Number(a) || 0, del: Number(d) || 0 };
         }
-        const files = [];
+        // What the commit will contain: only what is staged. The Changes panel does the staging.
         const entries = status.stdout.split("\0").filter(Boolean);
+        const files = [];
         for (const entry of entries.slice(0, 1000)) {
-          const xy = entry.slice(0, 2), path = entry.slice(3), fresh = xy === "??";
-          const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
-          const s = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
-          const stat = stats[path] ?? { add: 0, del: 0 };
-          files.push({ path, status: s, fresh, ...stat });
+          const x = entry[0], y = entry[1], path = entry.slice(3);
+          if (x === " " || x === "?" || x === "!") continue;
+          const s = x === "U" || y === "U" ? "U" : x === "D" ? "D" : x === "A" ? "A" : "M";
+          files.push({ path, status: s, ...(stats[path] ?? { add: 0, del: 0 }) });
         }
         if (key() !== context) return;
-        this.root = root; this.on = on; this.hasHead = head.code === 0; this.files = files; this.limited = entries.length > 1000; this.error = null;
+        this.root = root; this.on = on; this.files = files; this.limited = entries.length > 1000; this.error = null;
         this.watch(root, cx);
-        if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
-        // The first file's diff shows until you pick another.
-        if (!this.open && !this.closed && files.length) this.open = files[0].path;
-        if (this.open) {
-          try { await this.load(this.open, context); }
-          catch { if (key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
-        }
       } catch (e) { if (key() === context) this.error = String(e); }
       finally { this.loading = false; cx.notify(); }
     });
-  }
-
-  async load(path, context) {
-    const file = this.files.find((f) => f.path === path), root = this.root, on = this.on;
-    if (!file) return;
-    let lines;
-    if (file.fresh || (!this.hasHead && file.status === "A")) {
-      const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
-      if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
-      else if (text.includes("\0")) lines = ["Binary file · no text diff"];
-      else {
-        file.add = countLines(text);
-        lines = [`@@ -0,0 +1,${file.add} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => `+${l}`)];
-      }
-    } else {
-      const r = await exec("git", [...READ, "diff", ...(this.hasHead ? ["HEAD"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
-      if (r.code !== 0) throw new Error(r.stderr);
-      const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
-      lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
-    }
-    if (key() === context && this.open === path) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
-  }
-
-  setLines(lines) {
-    this.rows = diffRows(lines);
-    this.diffWidth = Math.max(300, ...this.rows.map(row => (row.text.length + 1) * 7 + 50));
-  }
-
-  pick(path, cx) {
-    this.open = this.open === path ? null : path; this.setLines([]); this.note = null;
-    this.closed = !this.open;
-    const context = this.context;
-    if (this.open) cx.spawn(async (cx) => {
-      try { await this.load(path, context); }
-      catch (e) { if (key() === context && this.open === path) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
-      cx.notify();
-    });
-    cx.notify();
   }
 
   // settings() only exposes the app's look and zoom/sounds, not the raw file,
@@ -281,6 +233,7 @@ export default class Changes extends View {
     if (this.generating) return;
     if (!this.root) { this.note = "AI: no repository loaded yet"; this.noteError = true; cx.notify(); return; }
     if (this.busy) { this.note = "AI: a commit is in progress"; this.noteError = true; cx.notify(); return; }
+    if (!this.files.length) { this.note = "AI: nothing staged. Stage files in Changes first."; this.noteError = true; cx.notify(); return; }
     const root = this.root, on = this.on;
     // One id per request: the timer gives up on a request that never answers, and a late reply is dropped.
     const id = this.genId = (this.genId ?? 0) + 1;
@@ -327,42 +280,15 @@ export default class Changes extends View {
     cx.notify();
   }
 
-  // Staged diff; if nothing is staged, the diff against HEAD (what Commit will stage with git add -A).
-  // Neither includes untracked files, which Commit does commit, so those are added separately.
+  // The staged diff, biggest file first: it is what the commit will contain. Nothing staged, nothing to describe.
   async readDiff(root, on) {
-    const r = await exec("git", [...READ, "diff", "--staged", "--no-color"], { cwd: root, on });
-    if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "git diff --staged failed");
-    let diff = r.stdout.trim();
-    if (!diff) {
-      const w = await exec("git", [...READ, "diff", "HEAD", "--no-color"], { cwd: root, on });
-      if (w.code !== 0) throw new Error((w.stderr || w.stdout).trim() || "git diff HEAD failed");
-      diff = w.stdout.trim();
-    }
-    const fresh = await this.untracked(root, on);
-    if (fresh) diff = diff ? `${diff}${NL}${fresh}` : fresh;
-    if (!diff) throw new Error("no changes to summarize (nothing staged, modified or untracked)");
-    // Biggest file first: git writes the diff in path order, so a cut would keep LICENSE and drop the code.
-    diff = byWeight(diff);
+    const r = await exec("git", [...READ, "diff", "--cached", "--no-color"], { cwd: root, on });
+    if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "git diff --cached failed");
+    const diff = r.stdout.trim();
+    if (!diff) throw new Error("nothing staged: stage files in Changes first");
+    const sorted = byWeight(diff);
     const LIMIT = 60000;
-    return { diff: diff.slice(0, LIMIT), truncated: diff.length > LIMIT };
-  }
-
-  // The untracked files as text for the model. Bounded, since all of it goes in one prompt.
-  async untracked(root, on) {
-    const status = await exec("git", [...READ, "status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: root, on }).catch(() => null);
-    if (!status || status.code !== 0) return "";
-    const paths = status.stdout.split("\0").filter((e) => e.startsWith("?? ")).map((e) => e.slice(3));
-    const out = [];
-    let budget = 20000;
-    for (const path of paths) {
-      if (budget <= 0) { out.push(`new file: ${path} (not shown)`); continue; }
-      const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
-      if (text === null || text.includes("\0")) { out.push(`new file: ${path} (binary or unreadable, not shown)`); continue; }
-      const lines = text.replace(/\n$/, "").split("\n"), body = lines.slice(0, 400).join("\n"), shown = body.slice(0, budget);
-      budget -= shown.length;
-      out.push(`new file: ${path} (${lines.length} lines, added by Commit)\n${shown.split("\n").map((l) => `+${l}`).join("\n")}${shown.length < body.length ? "\n+… (rest not shown)" : ""}`);
-    }
-    return out.join("\n");
+    return { diff: sorted.slice(0, LIMIT), truncated: sorted.length > LIMIT };
   }
 
   // The API key for a model: "api_key" in settings.json, or the environment variable named by "api_key_env".
@@ -476,13 +402,14 @@ export default class Changes extends View {
 
   commit(cx) {
     if (!this.message.trim() || !this.root || this.busy || this.loading || this.context !== key()) return;
+    if (!this.files.length) { this.note = "Nothing staged: stage files in Changes first."; this.noteError = true; cx.notify(); return; }
     const root = this.root, on = this.on, context = this.context, message = this.message.trim();
     const [headline, ...rest] = message.split(NL), bodyText = rest.join(NL).trim();
     const commitArgs = ["commit", "-m", headline.trim(), ...(bodyText ? ["-m", bodyText] : [])];
     this.busy = true; this.note = null;
     cx.spawn(async (cx) => {
       try {
-        for (const args of [["add", "-A"], commitArgs]) {
+        for (const args of [commitArgs]) {
           const r = await exec("git", args, { cwd: root, on });
           if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         }
@@ -611,51 +538,37 @@ export default class Changes extends View {
     if (!providers.length) rows.push(div().px(10).py(6).text_size(11).text_color(t.dim).child('Nothing to ask: install an agent (claude, codex, gemini, copilot, pi) or add "ai" with a provider'));
     // The menu lives inside the panel (clipped by its overflow), so size it to the panel.
     const h = Math.max(160, Math.min(360, (this.panelH ?? 620) - 70)), w = Math.max(140, Math.min(300, (this.panelW ?? 320) - 20));
-    return v_flex().id("model-menu").absolute().right(10).bottom(122).w(w).max_h(h).overflow_y_scroll().py(4).rounded(8).border_1().border_color(t.border).bg(t.popover).children(rows);
+    return v_flex().id("model-menu").absolute().right(10).bottom(162).w(w).max_h(h).overflow_y_scroll().py(4).rounded(8).border_1().border_color(t.border).bg(t.popover).children(rows);
   }
 
-
-  diffRow({ kind, number, text }, t) {
-    if (kind === "@") return div().w_full().px(12).h(20).flex_none().truncate().bg(t.raised).text_color(t.dim).child(text);
-    return h_flex().w_full().h(20).flex_none().gap(10).when(kind === "+", (e) => e.bg(t.ansi2 + "18")).when(kind === "-", (e) => e.bg(t.ansi1 + "18"))
-      .child(div().w(30).flex_none().text_right().text_color(t.dim).child(number === undefined ? "" : String(number)))
-      .child(div().flex_1().min_w(0).truncate().child(text));
-  }
 
   render(cx) {
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
-    const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
+    const enabled = Boolean(this.message.trim() && this.root && this.files.length && !this.busy && !this.loading);
     return v_flex().id("changes").size_full().on_size_change((size, cx) => { if (size.width !== this.panelW || size.height !== this.panelH) { this.panelW = size.width; this.panelH = size.height; if (this.menuOpen) cx.notify(); } }).relative().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape" && this.menuOpen) { this.menuOpen = false; cx.stop_propagation(); cx.notify(); return; }
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
       })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(div().font_semibold().child("Changes"))
-        .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`))
+        .child(div().font_semibold().child("Commit"))
+        .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} staged`))
         .child(div().flex_1()).child(div().text_size(11).text_color(t.ansi2).child(`+${add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)))
-      // overflow_y_scrollbar() wraps the list, so its flex sizing never reached the panel's layout.
-      .child(div().flex_1().min_h(44).max_h(this.files.length * 28 + 12).relative().border_b(1).border_color(t.border)
-        .child(v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6).children(this.files.map((f) => {
-        const parts = f.path.split("/"), name = parts.pop();
-        return h_flex().id(`change-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))
-          .child(div().w(14).text_size(11).text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : f.status === "U" ? t.ansi1 : t.blocked).child(f.status))
-          .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
-          .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${f.add}`))).when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
-      })).when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(this.error || (this.loading ? "Loading changes…" : this.root ? "No uncommitted changes" : "No folder")))))
-        .child(Scrollbar.vertical("changes-list").absolute().inset_0()))
+      .child(div().flex_1().min_h(44).relative().border_b(1).border_color(t.border)
+        .child(v_flex().id("staged-list").absolute().inset_0().overflow_y_scroll().p(6).children(this.files.map((f) => {
+          const parts = f.path.split("/"), name = parts.pop();
+          return h_flex().id(`staged-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7)
+            .child(div().w(14).text_size(11).text_color(f.status === "A" ? t.ansi2 : f.status === "D" || f.status === "U" ? t.ansi1 : t.blocked).child(f.status))
+            .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
+            .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${f.add}`))).when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
+        })).when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(this.error || (this.loading ? "Loading…" : !this.root ? "No folder" : "Nothing staged. Stage files in Changes, then write the message here.")))))
+        .child(Scrollbar.vertical("staged-list").absolute().inset_0()))
       .when(this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
-      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
-        .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
-          .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 20, (i) => String(i),
-            (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
-        .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
-        .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes"))))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(this.noteError ? t.ansi1 : t.muted).child(this.note)))
       .when(this.menuOpen, (e) => e.child(this.modelMenu(t)))
       .child(h_flex().flex_none().p(10).gap(8).items_end().border_t(1).border_color(t.border)
-        .child(div().id("commit-message").relative().flex_1().min_w(0).h(96).px(10).py(6).rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .child(div().id("commit-message").relative().flex_1().min_w(0).h(136).px(10).py(6).rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .when(!this.message.trim(), (e) => e.child(div().absolute().top(6).left(10).text_size(12).text_color(t.dim).child("Commit message")))
           .child(Editor.new(this.input).size_full().text_size(12).text_color(t.foreground)))
         .child(h_flex().id("commit-model").h(32).px(10).gap(6).items_center().rounded(8).border_1().border_color(this.menuOpen ? t.accent : t.border).text_size(11).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Model for commit messages: click to choose")

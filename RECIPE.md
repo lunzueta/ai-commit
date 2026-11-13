@@ -2,13 +2,13 @@
 
 ![AI commit message](preview.png)
 
-A Changes panel for Herdr with an AI button for the commit message. It shows the uncommitted changes (staged, unstaged and untracked) with a file list and a diff viewer, and next to the commit box it has a model button and a sparkles button. The model button opens a menu of what can write the message, and the sparkles button reads the diff and fills the commit box with one Conventional Commits subject line.
+A Changes panel for Herdr with an AI button for the commit message. It is the commit half of a Git panel: it shows what is staged, and next to the commit box it has a model button and a sparkles button. The model button opens a menu of what can write the message, and the sparkles button reads the diff and fills the commit box with one Conventional Commits subject line.
 
 Out of the box it asks the agent you already use — Claude Code, Codex, Gemini, Copilot or Pi — in its non-interactive mode, with the logins it already has, so there is nothing to configure and no key to paste. Adding an `ai` section to `settings.json` replaces that with exactly the providers you list, including Anthropic, OpenAI-compatible servers, Ollama and any other agent CLI.
 
 Someone who installs this and configures nothing sees one line per agent installed on their machine — "Claude Code", "Pi", "Codex", "Gemini", "Copilot" — with the heading 'No "ai" in settings.json: the agents you already have'; the button shows the first and the sparkles button asks it. No key, no model list, no third-party endpoint. If no agent is installed, the menu says 'Nothing to ask: install an agent (claude, codex, gemini, copilot, pi) or add "ai" with a provider'. An API provider (and its key) appears only because the person wrote it in `settings.json`.
 
-It is Herdr's shipped Changes panel (`mods/changes`) with the model button, the sparkles button and the AI code added, so it can replace that panel in a layout or sit beside it. `mod.json` says `{"place": "none"}`, so nothing docks by itself. Put it where the Changes panel goes in a layout:
+It is built to work with a staging panel, not to replace one: stage files in Changes (for example Changes Plus, `miriarte33/herdr-changes-plus`), and this panel writes the message for what is staged and commits exactly that. `mod.json` says `{"place": "none"}`, so nothing docks by itself. Put it where the Changes panel goes in a layout:
 
 ```json
 { "id": "changes", "type": "block", "content": { "mod": "ai-commit" } }
@@ -16,19 +16,19 @@ It is Herdr's shipped Changes panel (`mods/changes`) with the model button, the 
 
 `herdr-app do mod.open ai-commit` opens the same panel as a floating one, to try it before touching a layout (again closes it).
 
-**What you see:** a card with a header ("Changes", file count, +/− totals), a file list (status letter, folder in grey, file name, added and removed counts), a diff viewer with line numbers and green/red rows, a note line for messages and errors, and a footer with the commit box, the model button, the sparkles button and the Commit button. The model button is 32 px tall and shows the model label (truncated to about 110 px). The sparkles button is 32×32 px. The model menu opens over the panel, above the footer, sized to the panel (300 px wide, at most 360 px tall, smaller in a small panel).
+**What you see:** a card with a header ("Commit", staged file count, +/− totals), the list of staged files (status letter, folder in grey, file name, added and removed counts), a note line for messages and errors, and a footer with the commit box, the model button, the sparkles button and the Commit button. It has no diff viewer: the staging panel shows diffs. The model button is 32 px tall and shows the model label (truncated to about 110 px). The sparkles button is 32×32 px. The model menu opens over the panel, above the footer, sized to the panel (300 px wide, at most 360 px tall, smaller in a small panel).
 
 **How it behaves:**
-- The file list and diff refresh when the folder changes and every 10 seconds (every 30 seconds on remote spaces, since each refresh runs Git over SSH). On a local folder a watch refreshes them sooner.
-- Clicking a file shows its diff; clicking it again hides it. The first file is shown by default.
+- The staged list refreshes when the folder changes and every 10 seconds (every 30 seconds on remote spaces, since each refresh runs Git over SSH). On a local folder a watch refreshes it sooner.
+- Only staged files count. Unstaged and untracked files are not in the message and not in the commit.
 - An agent can think out loud before answering, so its output is not taken at face value: the subject is the last line shaped like `type(scope): subject`, and Claude Code is asked for JSON, where only the final message is (`result`). A line of the agent's own plan never reaches the commit box.
 - Model button (the name with ▾, or Escape to close): opens a menu of the providers with ✓ on the selected one. An agent is a single line with its name. An agent shows its own name and one entry, "default (its own model)"; an API provider lists the models it reports (see below). Lists are fetched when the menu is first opened. Clicking an entry selects it for the sparkles button; the choice is kept in shared state (`ai-commit.selected`) and shown again when the panel opens.
 - Sparkles button (or the keyboard command below): the button spins and the note line says "AI: generating commit message…". On success the subject appears in the commit box. With no `ai` section the first installed agent is used. If the subject is over 50 characters, the mod asks the model once more for a shorter one; if the result is still long, the note says how many characters it has. If the diff is longer than the provider can take (60,000 characters for an API provider, less for an agent), the note says it was truncated. A request that has not answered after 3 minutes is given up on (the note says so and the button works again); a reply that arrives later is dropped.
 - Failures show a reason in the note line, in red: no configuration, missing key, HTTP status, empty reply, no repository, no changes. Informational notes (truncation, subject length) are shown in grey and disappear on the next file click or commit.
 - If you switch repositories while a message is generating, the result is dropped.
 - A commit already running blocks generation with "AI: a commit is in progress".
-- The commit box is multi-line. The sparkles button fills it with a subject, a blank line and a body of 2 to 4 short bullets (saying what changed and why). Enter adds a line; the Commit button commits.
-- Commit runs `git add -A`, then `git commit -m <subject>` and, when there is a body, `-m <body>`, so git keeps the paragraph.
+- The commit box is multi-line. The sparkles button fills it with a subject, a blank line and a body of 2 to 4 short bullets (saying what changed and why). Enter adds a line; the Commit button commits. The box shows about four lines and scrolls for the rest.
+- Commit runs `git commit -m <subject>` and, when there is a body, `-m <body>`, so git keeps the paragraph. It never runs `git add`: with nothing staged it refuses and says so.
 
 **Keyboard:** next to the mod, `keys.json` holds the key it expects:
 
@@ -40,7 +40,7 @@ Merge that section into `~/.config/herdr-app/keys.json` (ask before replacing a 
 
 **Built from:**
 - One mod, `mods/ai-commit/`: `main.js` (the panel), `mod.json` (`"place": "none"` and an overlay, so nothing docks by itself and `mod.open` shows it floating) and `sparkles.svg` (the icon, tinted with the text color). Next to that folder there are `keys.json`, `RECIPE.md` and `preview.png`, and no `layouts/` folder.
-- Built from the diff viewer and file list of Herdr's shipped `changes` panel, with the commit box, the model button and the AI button added.
+- Built from the shipped `changes` panel's commit box and model code; the staged list and the AI code are its own. Nothing is copied from the diff viewer any more.
 - `herdr` functions: `exec` (Git with `on:` for remote spaces; the agent CLIs; `printenv`/`powershell` only to read an environment variable named in `api_key_env`), `readTextFile` (reads `settings.json` in the app home, and a changed file's text for the preview and for the AI), `knownAgents` (which agents are installed here, for the no-configuration case), `appHome`, `watchFolder`, `theme`, `settings`, `shared` / `setShared`, `nextCommand`, `focused`, `spaces`, `panes`, `cx.spawn`, `cx.timer`, `cx.focus_handle`.
 - Commands: none. The mod never calls `run(...)`.
 - Programs it runs: `git` (status, diff, add, commit; `git --no-optional-locks` with fsmonitor and index refresh off, so a refresh does not write under `.git` and wake the folder watch); `printenv` then `powershell` to read a key from the environment (`powershell` only where `printenv` is not there, such as Windows); and, for an `agent` provider, that agent's CLI in its non-interactive mode, with its own logins:
@@ -52,7 +52,7 @@ Merge that section into `~/.config/herdr-app/keys.json` (ask before replacing a 
   - any other CLI, through `"command": ["…"]` in `settings.json`, with the prompt as the last argument
   On Windows several of these are `.cmd` shims that a direct spawn does not find by their bare name (and a batch file cannot carry a line break): the mod retries `<name>.cmd` and hands it the prompt on one line, with each line break written as ⏎ (one character, so flattening does not grow the prompt).
 - Network: an `agent` provider reaches the network through that agent, which is already logged in; the mod itself makes no request for it. For an API provider, `fetch` to its endpoint: `https://api.anthropic.com/v1/messages` for `anthropic`; `<base_url>/chat/completions` for `openai` (default `https://api.openai.com/v1`); `<base_url>/api/chat` for `ollama` (default `http://127.0.0.1:11434`); the model list from `/v1/models`, `<base_url>/models` or `/api/tags`.
-- What the AI is sent: the changed files with their added/removed counts, then the diff, biggest file first (so a cut keeps the code and not a license file): `git diff --staged` if anything is staged, else `git diff HEAD`, plus the untracked files as text (git diff leaves them out, but Commit adds them): the first 400 lines of each, 20,000 characters in all. Files it cannot read are listed by name only. An API provider gets 60,000 characters of it; an agent gets what is left of a 7,600-character prompt once the instructions and the file list are in, because the prompt has to fit a command line (~8,191 on Windows), and the note line says when that happened.
+- What the AI is sent: the staged diff only (`git diff --cached`), biggest file first, so a cut keeps the code and not a license file. An API provider gets 60,000 characters of it; an agent gets what is left of a 7,600-character prompt once the instructions and the file list are in, because the prompt has to fit a command line (~8,191 on Windows). The note line says when that happened.
 - Files read outside the mod folder: `<app home>/settings.json` (the `ai` section; read on every click and every timer tick) and files in the repository being previewed or summarized.
 - Files written: none. The mod never writes a file, in the repository or in the app home.
 
